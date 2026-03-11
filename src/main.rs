@@ -15,10 +15,25 @@ use memory::format_context;
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cfg = config::load(Path::new("config.toml"));
 
-    let model = provider::build_model(&cfg.llm)?;
     let emb = embeddings::build_embeddings(&cfg.embeddings)?;
     let mem = memory::ConversationMemory::new(&cfg.memory, emb, cfg.embeddings.dimensions).await?;
 
+    // Handle --import <file> --user <user_id> mode.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--import" {
+        let file_path = Path::new(&args[2]);
+        let user_id = if args.len() >= 5 && args[3] == "--user" {
+            &args[4]
+        } else {
+            &cfg.user.id
+        };
+        println!("Importing from {} for user '{user_id}'...", file_path.display());
+        let count = mem.import_jsonl(file_path, user_id).await?;
+        println!("Imported {count} entries.");
+        return Ok(());
+    }
+
+    let model = provider::build_model(&cfg.llm)?;
     let graph = create_react_agent(model, vec![])?;
 
     println!(
@@ -44,8 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             continue;
         }
 
-        // Retrieve relevant past conversations from memory.
-        let context_entries = mem.retrieve(user_id, input).await?;
+        // Retrieve relevant past entries from memory (all categories).
+        let context_entries = mem.retrieve(user_id, input, None).await?;
         let context = format_context(&context_entries);
 
         // Build the system prompt: base persona + RAG context.
@@ -70,8 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("\n{}\n", response);
 
             // Persist both the user message and the assistant response.
-            mem.store(user_id, "human", input).await?;
-            mem.store(user_id, "ai", response).await?;
+            mem.store(user_id, "conversation", "human", input).await?;
+            mem.store(user_id, "conversation", "ai", response).await?;
         }
     }
 
