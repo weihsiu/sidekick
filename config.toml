@@ -1,0 +1,33 @@
+[llm]
+# Provider: "openai", "anthropic", "gemini", or "ollama"
+provider = "openai"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+
+[embeddings]
+# Provider for generating embeddings: "openai", "anthropic", "gemini", or "ollama"
+provider = "openai"
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+dimensions = 1536
+
+[memory]
+# Path to the LanceDB database directory (persistent on disk)
+db_path = "data/sidekick.lancedb"
+table_name = "conversations"
+# Number of relevant past messages to retrieve per query
+top_k = 10
+
+[agent]
+# System prompt that defines the agent's persona and behavior.
+# RAG context from past conversations is appended automatically.
+system_prompt = """
+You are Sidekick, a helpful AI assistant with long-term memory. \
+You remember past conversations and use them to provide more relevant, \
+personalized responses. Be concise, accurate, and friendly."""
+
+[user]
+# Unique user identifier — used to partition conversation memory
+id = "default-user"
