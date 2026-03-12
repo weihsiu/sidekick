@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use anyhow::{bail, Result};
 use synaptic::anthropic::{AnthropicChatModel, AnthropicConfig};
-use synaptic::core::{ChatModel, SynapticError};
+use synaptic::core::ChatModel;
 use synaptic::gemini::{GeminiChatModel, GeminiConfig};
 use synaptic::models::HttpBackend;
 use synaptic::ollama::{OllamaChatModel, OllamaConfig};
@@ -9,12 +10,12 @@ use synaptic::openai::{OpenAiChatModel, OpenAiConfig};
 
 use crate::config::LlmConfig;
 
-pub fn build_model(config: &LlmConfig) -> Result<Arc<dyn ChatModel>, SynapticError> {
+pub fn build_model(config: &LlmConfig) -> Result<Arc<dyn ChatModel>> {
     let backend = Arc::new(HttpBackend::new());
 
     match config.provider.as_str() {
         "openai" => {
-            let mut cfg = OpenAiConfig::new(config.api_key(), &config.model);
+            let mut cfg = OpenAiConfig::new(config.api_key()?, &config.model);
             if let Some(url) = &config.base_url {
                 cfg = cfg.with_base_url(url);
             }
@@ -22,7 +23,7 @@ pub fn build_model(config: &LlmConfig) -> Result<Arc<dyn ChatModel>, SynapticErr
         }
 
         "anthropic" => {
-            let mut cfg = AnthropicConfig::new(config.api_key(), &config.model);
+            let mut cfg = AnthropicConfig::new(config.api_key()?, &config.model);
             if let Some(url) = &config.base_url {
                 cfg = cfg.with_base_url(url);
             }
@@ -30,7 +31,7 @@ pub fn build_model(config: &LlmConfig) -> Result<Arc<dyn ChatModel>, SynapticErr
         }
 
         "gemini" => {
-            let mut cfg = GeminiConfig::new(config.api_key(), &config.model);
+            let mut cfg = GeminiConfig::new(config.api_key()?, &config.model);
             if let Some(url) = &config.base_url {
                 cfg = cfg.with_base_url(url);
             }
@@ -45,8 +46,6 @@ pub fn build_model(config: &LlmConfig) -> Result<Arc<dyn ChatModel>, SynapticErr
             Ok(Arc::new(OllamaChatModel::new(cfg, backend)))
         }
 
-        other => Err(SynapticError::Config(format!(
-            "unsupported provider: '{other}'. Supported: openai, anthropic, gemini, ollama"
-        ))),
+        other => bail!("unsupported provider: '{other}'. Supported: openai, anthropic, gemini, ollama"),
     }
 }

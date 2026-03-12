@@ -2,7 +2,7 @@
 
 An agentic AI assistant built in Rust with [Synaptic](https://github.com/dnw3/synaptic) and [LanceDB](https://github.com/lancedb/lancedb).
 
-All conversations are persisted in a local LanceDB vector database. Past entries are retrieved via hybrid search (dense vector + full-text keyword matching with Reciprocal Rank Fusion) and injected as context on every turn, giving the agent long-term memory scoped per user.
+Sidekick runs as an HTTP server serving multiple users. Each user gets their own LanceDB database for complete memory isolation. Past entries are retrieved via hybrid search (dense vector + full-text keyword matching with Reciprocal Rank Fusion) and injected as context on every turn, giving the agent long-term memory per user.
 
 Entries are categorized (e.g. `conversation`, `knowledge`) so you can batch-import structured knowledge alongside organic chat history.
 
@@ -22,7 +22,14 @@ All LLM providers and embeddings providers are compiled in. No recompilation is 
 
 ## Configuration
 
-Edit `config.toml` to choose your providers, models, and memory settings. The agent reads this file at startup.
+Edit `config.toml` to choose your providers, models, and memory settings. The server reads this file at startup.
+
+### `[server]` — HTTP server
+
+| Field | Description |
+|-------|-------------|
+| `host` | Bind address (e.g. `"0.0.0.0"`) |
+| `port` | Listen port (e.g. `3000`) |
 
 ### `[llm]` — Chat model
 
@@ -45,13 +52,28 @@ Used to generate vector embeddings for memory storage and retrieval.
 | `base_url` | *(optional)* Override the API endpoint |
 | `dimensions` | Embedding vector size (must match the model — e.g. `1536` for `text-embedding-3-small`) |
 
-### `[memory]` — LanceDB store
+### `[memory]` — Per-user LanceDB store
+
+Each user gets their own database at `{base_path}/{user_id}.lancedb`.
 
 | Field | Description |
 |-------|-------------|
-| `db_path` | Path to the LanceDB database directory on disk |
-| `table_name` | Table name within the database |
+| `base_path` | Base directory for per-user LanceDB databases |
+| `table_name` | Table name within each database |
 | `top_k` | Number of relevant entries to retrieve per query |
+| `pool_size` | Max number of user DBs to keep open in the LRU pool |
+| `chat_window` | Number of recent chat messages to keep as short-term conversation context |
+
+### `[rerank]` — Result reranking
+
+| Field | Description |
+|-------|-------------|
+| `provider` | `"mock"` for pass-through (future: `"cohere"`, `"jina"`) |
+| `top_n` | Number of top results to keep after reranking |
+
+### `[rerank.category_weights]` — Category boost multipliers
+
+Categories not listed default to `1.0`.
 
 ### `[agent]` — System prompt
 
@@ -59,17 +81,15 @@ Used to generate vector embeddings for memory storage and retrieval.
 |-------|-------------|
 | `system_prompt` | Base system prompt defining the agent's persona and behavior. RAG context is appended automatically. |
 
-### `[user]` — User identity
-
-| Field | Description |
-|-------|-------------|
-| `id` | Unique user identifier — partitions memory per user |
-
 ### Example configurations
 
 **OpenAI (LLM + embeddings):**
 
 ```toml
+[server]
+host = "0.0.0.0"
+port = 3000
+
 [llm]
 provider = "openai"
 model = "gpt-4o"
@@ -82,20 +102,27 @@ api_key_env = "OPENAI_API_KEY"
 dimensions = 1536
 
 [memory]
-db_path = "data/sidekick.lancedb"
+base_path = "data/users"
 table_name = "conversations"
 top_k = 10
+pool_size = 100
+chat_window = 20
+
+[rerank]
+provider = "mock"
+top_n = 5
 
 [agent]
 system_prompt = "You are Sidekick, a helpful AI assistant with long-term memory."
-
-[user]
-id = "alice"
 ```
 
 **Anthropic LLM + OpenAI embeddings:**
 
 ```toml
+[server]
+host = "0.0.0.0"
+port = 3000
+
 [llm]
 provider = "anthropic"
 model = "claude-sonnet-4-20250514"
@@ -108,15 +135,18 @@ api_key_env = "OPENAI_API_KEY"
 dimensions = 1536
 
 [memory]
-db_path = "data/sidekick.lancedb"
+base_path = "data/users"
 table_name = "conversations"
 top_k = 10
+pool_size = 100
+chat_window = 20
+
+[rerank]
+provider = "mock"
+top_n = 5
 
 [agent]
 system_prompt = "You are Sidekick, a helpful AI assistant with long-term memory."
-
-[user]
-id = "alice"
 ```
 
 **Fully local with Ollama:**
@@ -124,6 +154,10 @@ id = "alice"
 Ollama runs locally and does not require an API key. Make sure the Ollama server is running before starting sidekick. The default base URL is `http://localhost:11434` — override it if your instance is on a different host/port.
 
 ```toml
+[server]
+host = "0.0.0.0"
+port = 3000
+
 [llm]
 provider = "ollama"
 model = "llama3"
@@ -138,20 +172,27 @@ api_key_env = "UNUSED"
 dimensions = 768
 
 [memory]
-db_path = "data/sidekick.lancedb"
+base_path = "data/users"
 table_name = "conversations"
 top_k = 10
+pool_size = 100
+chat_window = 20
+
+[rerank]
+provider = "mock"
+top_n = 5
 
 [agent]
 system_prompt = "You are Sidekick, a helpful AI assistant with long-term memory."
-
-[user]
-id = "alice"
 ```
 
 **Gemini:**
 
 ```toml
+[server]
+host = "0.0.0.0"
+port = 3000
+
 [llm]
 provider = "gemini"
 model = "gemini-2.0-flash"
@@ -164,15 +205,18 @@ api_key_env = "OPENAI_API_KEY"
 dimensions = 1536
 
 [memory]
-db_path = "data/sidekick.lancedb"
+base_path = "data/users"
 table_name = "conversations"
 top_k = 10
+pool_size = 100
+chat_window = 20
+
+[rerank]
+provider = "mock"
+top_n = 5
 
 [agent]
 system_prompt = "You are Sidekick, a helpful AI assistant with long-term memory."
-
-[user]
-id = "alice"
 ```
 
 ## Run
@@ -183,20 +227,81 @@ Set the appropriate environment variables for your providers, then:
 cargo run --release
 ```
 
-Type a message at the `>` prompt. Type `quit` or `exit` to stop.
+The server starts on the configured host and port. Set `RUST_LOG` to control log verbosity:
 
-Conversation history is stored in the `db_path` directory and persists across restarts. Each user (identified by `[user] id`) has their own isolated memory.
+```sh
+RUST_LOG=sidekick=debug cargo run --release
+```
+
+## API
+
+All endpoints accept and return JSON.
+
+### `POST /v1/chat`
+
+Send a message and get a response. The user's message and the assistant's response are both stored in memory automatically.
+
+```json
+{
+  "user_id": "alice",
+  "message": "What did we talk about yesterday?"
+}
+```
+
+Response:
+
+```json
+{
+  "response": "Yesterday we discussed..."
+}
+```
+
+### `POST /v1/memory/store`
+
+Store an entry directly into a user's memory.
+
+```json
+{
+  "user_id": "alice",
+  "category": "knowledge",
+  "role": "system",
+  "content": "Rust's ownership system prevents data races at compile time."
+}
+```
+
+### `POST /v1/memory/search`
+
+Search a user's memory without triggering a chat.
+
+```json
+{
+  "user_id": "alice",
+  "query": "Rust ownership",
+  "categories": ["knowledge"]
+}
+```
+
+Response:
+
+```json
+{
+  "entries": [
+    {
+      "category": "knowledge",
+      "role": "system",
+      "content": "Rust's ownership system prevents data races at compile time.",
+      "timestamp": "2025-01-15T10:30:00+00:00"
+    }
+  ]
+}
+```
 
 ## Batch import
 
-You can bulk-load entries from a JSONL file:
+You can bulk-load entries from a JSONL file for a specific user:
 
 ```sh
-# Uses user_id from config.toml
-cargo run -- --import data/knowledge.jsonl
-
-# Override user_id on the command line
-cargo run -- --import data/knowledge.jsonl --user alice
+cargo run -- --import alice data/knowledge.jsonl
 ```
 
 Each line in the JSONL file is a JSON object with the following fields:
@@ -207,7 +312,7 @@ Each line in the JSONL file is a JSON object with the following fields:
 | `content` | yes | | The text content |
 | `role` | no | `"system"` | Role label (`"system"`, `"human"`, `"ai"`) |
 
-The `user_id` comes from the `--user` flag (or `config.toml`), and the `timestamp` is set to the time of import for all entries in the batch.
+The `timestamp` is set to the time of import for all entries in the batch.
 
 **Example `knowledge.jsonl`:**
 
@@ -217,25 +322,33 @@ The `user_id` comes from the `--user` flag (or `config.toml`), and the `timestam
 {"category": "faq", "content": "Q: How do I reset my password? A: Go to Settings > Account > Reset Password."}
 ```
 
+## Architecture
+
+- **Multi-user**: Each user gets an isolated LanceDB database at `data/users/{user_id}.lancedb`
+- **Memory pool**: An LRU cache keeps the most recently active user databases open, evicting idle ones to conserve file descriptors
+- **Thread-safe writes**: A per-database mutex serialises store operations and FTS index rebuilds while reads proceed concurrently
+- **Dual memory**: Long-term memory via LanceDB hybrid search (RAG) + short-term chat window via Synaptic's `ConversationWindowMemory` for recent conversation continuity
+- **Hybrid retrieval**: Dense vector cosine similarity + full-text keyword matching, fused with Reciprocal Rank Fusion (RRF)
+- **Reranking**: Retrieved results are reranked with configurable category weight boosts
+
 ## How it works
 
-1. User sends a message
-2. The message is embedded and used to search LanceDB via hybrid search (dense vector cosine similarity + full-text keyword matching, fused with Reciprocal Rank Fusion)
-3. Results are filtered by user ID; all categories are searched
-4. The configurable system prompt + retrieved context are injected as a system message
-5. The LLM generates a response
-6. Both the user message and the assistant response are stored in LanceDB (category: `conversation`) with their embeddings
-
-This gives the agent persistent, semantic long-term memory that grows over time and can be seeded with domain knowledge via batch import.
+1. Client sends a `POST /v1/chat` with a `user_id` and `message`
+2. The user's database is opened from the pool (or created on first use)
+3. The message is embedded and used to search the user's LanceDB via hybrid search (long-term memory)
+4. The configurable system prompt + retrieved RAG context are injected as a system message
+5. The recent chat window (last N messages) is included as message history for conversational continuity
+6. The LLM generates a response with both long-term and short-term context
+7. Both the user message and the assistant response are stored in LanceDB (long-term) and the chat window (short-term)
+8. The response is returned to the client
 
 ## LanceDB schema
 
-Each entry in the database has the following columns:
+Each entry in a user's database has the following columns:
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | string | UUID |
-| `user_id` | string | User identifier |
 | `category` | string | Entry category (`conversation`, `knowledge`, etc.) |
 | `role` | string | `human`, `ai`, or `system` |
 | `content` | string | Text content |
@@ -249,9 +362,10 @@ A full-text search index on `content` is maintained automatically for hybrid ret
 ```
 config.toml          # All runtime configuration
 src/
-  main.rs            # Agentic loop + CLI (--import)
+  main.rs            # HTTP server, API handlers, --import CLI
   config.rs          # Config file parsing
   provider.rs        # Builds the ChatModel from config
   embeddings.rs      # Builds the Embeddings model from config
-  memory.rs          # LanceDB-backed memory: store, retrieve, batch import
+  rerank.rs          # Reranker trait and mock implementation
+  memory.rs          # Per-user LanceDB memory: store, retrieve, batch import, pool
 ```
