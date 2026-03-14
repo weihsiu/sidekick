@@ -1,0 +1,76 @@
+[server]
+host = "0.0.0.0"
+port = 3000
+# Public URL the browser sees (used for OAuth redirect URIs).
+base_url = "http://localhost:3000"
+# URL of the frontend app to redirect to after successful login.
+frontend_url = "http://localhost:5173"
+
+[auth]
+# Path to the SQLite database for users and sessions.
+db_path = "data/sidekick.db"
+
+# OAuth providers — add more sections to support additional platforms.
+[auth.providers.google]
+client_id = "66634641937-ga66aeqos3tl6mt61k9lkltau1ghc5op.apps.googleusercontent.com"
+client_secret_env = "GOOGLE_CLIENT_SECRET"
+auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+userinfo_url = "https://www.googleapis.com/oauth2/v3/userinfo"
+scopes = ["openid", "email", "profile"]
+
+[auth.providers.facebook]
+client_id = "YOUR_FACEBOOK_APP_ID"
+client_secret_env = "FACEBOOK_CLIENT_SECRET"
+auth_url = "https://www.facebook.com/v19.0/dialog/oauth"
+token_url = "https://graph.facebook.com/v19.0/oauth/access_token"
+userinfo_url = "https://graph.facebook.com/me?fields=id,name,email"
+scopes = ["email", "public_profile"]
+
+[llm]
+# Provider: "openai", "anthropic", "gemini", or "ollama"
+provider = "openai"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+
+[embeddings]
+# Provider for generating embeddings: "openai", "anthropic", "gemini", or "ollama"
+provider = "openai"
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+dimensions = 1536
+
+[memory]
+# Base directory for per-user LanceDB databases.
+# Each user gets {base_path}/{user_id}.lancedb
+base_path = "data/users"
+table_name = "conversations"
+# Number of relevant past messages to retrieve per query
+top_k = 10
+# Max number of user DBs to keep open in the LRU pool
+pool_size = 100
+# Number of recent chat messages to keep in the conversation window.
+# These are sent to the LLM as message history for short-term context.
+chat_window = 20
+
+[rerank]
+# Reranker provider: "mock" for pass-through, future: "cohere", "jina"
+provider = "mock"
+# Number of top results to keep after reranking
+top_n = 5
+
+# Category weight multipliers applied after reranking.
+# Categories not listed default to 1.0.
+[rerank.category_weights]
+knowledge = 1.5
+faq = 1.2
+
+[agent]
+# System prompt that defines the agent's persona and behavior.
+# RAG context from past conversations is appended automatically.
+system_prompt = """
+You are Sidekick, a helpful AI assistant with long-term memory. \
+You remember past conversations and use them to provide more relevant, \
+personalized responses. Be concise, accurate, and friendly."""
