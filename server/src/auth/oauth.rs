@@ -14,6 +14,10 @@ pub struct UserInfo {
     pub id: String,
     pub name: String,
     pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub picture: String,
+    pub locale: String,
 }
 
 /// Type alias for a BasicClient with auth_url and token_url set.
@@ -105,8 +109,8 @@ impl OAuthProvider {
             .await
             .context("failed to parse userinfo response")?;
 
-        // Google: { "sub": "...", "name": "...", "email": "..." }
-        // Facebook: { "id": "...", "name": "...", "email": "..." }
+        // Google: { "sub", "name", "email", "given_name", "family_name", "picture", "locale" }
+        // Facebook: { "id", "name", "email", "first_name", "last_name", "picture", "locale" }
         let id = resp["sub"]
             .as_str()
             .or_else(|| resp["id"].as_str())
@@ -116,6 +120,27 @@ impl OAuthProvider {
         let name = resp["name"].as_str().unwrap_or("Unknown").to_string();
         let email = resp["email"].as_str().unwrap_or("").to_string();
 
-        Ok(UserInfo { id, name, email })
+        // Google uses "given_name"/"family_name"; Facebook uses "first_name"/"last_name".
+        let first_name = resp["given_name"]
+            .as_str()
+            .or_else(|| resp["first_name"].as_str())
+            .unwrap_or("")
+            .to_string();
+        let last_name = resp["family_name"]
+            .as_str()
+            .or_else(|| resp["last_name"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Facebook nests picture as {"data": {"url": "..."}}, Google returns a direct URL string.
+        let picture = resp["picture"]
+            .as_str()
+            .or_else(|| resp["picture"]["data"]["url"].as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let locale = resp["locale"].as_str().unwrap_or("").to_string();
+
+        Ok(UserInfo { id, name, email, first_name, last_name, picture, locale })
     }
 }

@@ -21,13 +21,15 @@ pub struct ServerConfig {
     pub port: u16,
     /// URL the browser sees (for OAuth redirect URIs).
     pub base_url: String,
-    /// URL of the frontend app to redirect to after successful login.
-    #[serde(default = "default_frontend_url")]
-    pub frontend_url: String,
+    /// URL to redirect to after login. Defaults to base_url.
+    /// Only set this when the frontend is served separately (e.g. Vite dev server).
+    pub frontend_url: Option<String>,
 }
 
-fn default_frontend_url() -> String {
-    "/".to_string()
+impl ServerConfig {
+    pub fn frontend_url(&self) -> &str {
+        self.frontend_url.as_deref().unwrap_or(&self.base_url)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,7 +89,7 @@ pub struct MemoryConfig {
     pub top_k: usize,
     /// Max number of user DBs to keep open in the LRU pool.
     pub pool_size: usize,
-    /// Number of recent chat messages to keep in the conversation window.
+    /// Number of recent chat messages to keep in the chat window.
     /// These are passed to the LLM as message history for short-term context.
     pub chat_window: usize,
 }
@@ -130,6 +132,17 @@ impl EmbeddingsConfig {
 pub fn load(path: &Path) -> Result<AppConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    toml::from_str(&content)
-        .with_context(|| format!("failed to parse config file {}", path.display()))
+    let mut cfg: AppConfig = toml::from_str(&content)
+        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+
+    // Allow environment variables to override server URLs so the same
+    // config.toml works for both local dev and production deployment.
+    if let Ok(val) = std::env::var("BASE_URL") {
+        cfg.server.base_url = val;
+    }
+    if let Ok(val) = std::env::var("FRONTEND_URL") {
+        cfg.server.frontend_url = Some(val);
+    }
+
+    Ok(cfg)
 }

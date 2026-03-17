@@ -93,6 +93,10 @@ impl AuthnBackend for AuthBackend {
                 &user_info.id,
                 &user_info.name,
                 &user_info.email,
+                &user_info.first_name,
+                &user_info.last_name,
+                &user_info.picture,
+                &user_info.locale,
             )
             .await?;
 

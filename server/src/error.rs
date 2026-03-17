@@ -8,6 +8,10 @@ use axum::Json;
 /// simply use `?` on any fallible operation.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    /// Not authenticated — mapped to 401.
+    #[error("not authenticated")]
+    Unauthorized,
+
     /// An internal/unexpected error — mapped to 500.
     #[error("{0:#}")]
     Internal(#[from] anyhow::Error),
@@ -15,9 +19,12 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        tracing::error!(error = %self, "request failed");
         let (status, message) = match &self {
-            ApiError::Internal(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
+            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "not authenticated".to_string()),
+            ApiError::Internal(err) => {
+                tracing::error!(error = %err, "request failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))
+            }
         };
         let body = Json(serde_json::json!({ "error": message }));
         (status, body).into_response()

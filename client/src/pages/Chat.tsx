@@ -1,22 +1,138 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useAuth } from "../auth";
 
 interface Message {
+  id?: number;
   role: "human" | "ai";
   content: string;
 }
+
+const PAGE_SIZE = 20;
 
 export function ChatPage() {
   const { user, logout } = useAuth();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesTopRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const initialLoadDone = useRef(false);
 
+  const loadHistory = useCallback(async (before?: number) => {
+    if (loadingHistory) return;
+    setLoadingHistory(true);
+
+    try {
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE), category: "conversation" });
+      if (before !== undefined) params.set("before", String(before));
+
+      const res = await fetch(`/v1/history?${params}`);
+      if (!res.ok) return;
+
+      const older: Message[] = await res.json();
+      if (older.length < PAGE_SIZE) setHasMore(false);
+      if (older.length === 0) return;
+
+      const container = messagesContainerRef.current;
+      const prevScrollHeight = container?.scrollHeight ?? 0;
+
+      setMessages((prev) => [...older, ...prev]);
+
+      // Preserve scroll position when prepending older messages.
+      if (before !== undefined && container) {
+        requestAnimationFrame(() => {
+          container.scrollTop = container.scrollHeight - prevScrollHeight;
+        });
+      }
+    } finally {
+      setLoadingHistory(false);
+    }
+  }, [loadingHistory]);
+
+  // Load initial history on mount.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, sending]);
+    if (initialLoadDone.current) return;
+    initialLoadDone.current = true;
+    loadHistory().then(() => {
+      // Scroll to bottom after initial load and sync scroll tracking.
+      requestAnimationFrame(() => {
+        messagesEndRef.current?.scrollIntoView();
+      });
+    });
+  }, [loadHistory]);
+
+  // Auto-scroll to bottom when the user sends or receives a message.
+  const prevMessageCount = useRef(0);
+  useEffect(() => {
+    // Only auto-scroll when messages are appended (new), not prepended (history).
+    if (messages.length > prevMessageCount.current && prevMessageCount.current > 0) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+    prevMessageCount.current = messages.length;
+  }, [messages.length]);
+
+  // Smart header: detect user gesture direction directly.
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    const header = headerRef.current;
+    if (!container || !header) return;
+
+    let touchStartY = 0;
+
+    // Wheel: deltaY > 0 = wheel/trackpad scroll "down" (content moves up)
+    const onWheel = (e: WheelEvent) => {
+      if (Math.abs(e.deltaY) < 5) return;
+      if (e.deltaY < 0) {
+        // Scrolling up through content (finger/wheel moving down)
+        header.classList.remove("chat-header-hidden");
+      } else {
+        // Scrolling down through content (finger/wheel moving up)
+        header.classList.add("chat-header-hidden");
+      }
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      touchStartY = e.touches[0].clientY;
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      const delta = e.touches[0].clientY - touchStartY;
+      if (Math.abs(delta) < 10) return;
+      if (delta > 0) {
+        // Finger dragging down — viewing older content
+        header.classList.remove("chat-header-hidden");
+      } else {
+        // Finger dragging up — viewing newer content
+        header.classList.add("chat-header-hidden");
+      }
+      touchStartY = e.touches[0].clientY;
+    };
+
+    container.addEventListener("wheel", onWheel, { passive: true });
+    container.addEventListener("touchstart", onTouchStart, { passive: true });
+    container.addEventListener("touchmove", onTouchMove, { passive: true });
+    return () => {
+      container.removeEventListener("wheel", onWheel);
+      container.removeEventListener("touchstart", onTouchStart);
+      container.removeEventListener("touchmove", onTouchMove);
+    };
+  }, []);
+
+  // Infinite scroll — load older messages when scrolling to top.
+  const handleScroll = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container || !hasMore || loadingHistory) return;
+
+    if (container.scrollTop < 100) {
+      const oldest = messages.find((m) => m.id !== undefined);
+      if (oldest?.id) loadHistory(oldest.id);
+    }
+  }, [hasMore, loadingHistory, messages, loadHistory]);
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value);
@@ -30,9 +146,9 @@ export function ChatPage() {
 
     setInput("");
     if (textareaRef.current) {
-        textareaRef.current.style.height = "auto";
+      textareaRef.current.style.height = "auto";
     }
-    
+
     setMessages((prev) => [...prev, { role: "human", content: text }]);
     setSending(true);
 
@@ -74,15 +190,19 @@ export function ChatPage() {
     }
   };
 
-  const userInitial = user?.name ? user.name.charAt(0).toUpperCase() : "U";
+  const userAvatar = user?.picture ? (
+    <img className="user-avatar" src={user.picture} alt={user.name} referrerPolicy="no-referrer" />
+  ) : (
+    <div className="user-avatar">{user?.name ? user.name.charAt(0).toUpperCase() : "U"}</div>
+  );
 
   return (
     <div className="chat-page">
-      <header className="chat-header">
+      <header ref={headerRef} className="chat-header">
         <h1>Sidekick</h1>
         <div className="header-right">
           <div className="user-profile">
-            <div className="user-avatar">{userInitial}</div>
+            {userAvatar}
             <span className="user-name">{user?.name}</span>
           </div>
           <button onClick={logout} className="logout-btn">
@@ -91,9 +211,16 @@ export function ChatPage() {
         </div>
       </header>
 
-      <div className="messages-container">
+      <div className="messages-container" ref={messagesContainerRef} onScroll={handleScroll}>
         <div className="messages">
-          {messages.length === 0 && (
+          {loadingHistory && (
+            <div className="history-loading">Loading older messages...</div>
+          )}
+          {!hasMore && messages.length > 0 && (
+            <div className="history-end">Beginning of conversation</div>
+          )}
+          <div ref={messagesTopRef} />
+          {messages.length === 0 && !loadingHistory && (
             <div className="empty-state">
               <div className="empty-state-icon">✨</div>
               <h3>Welcome to Sidekick</h3>
@@ -101,9 +228,9 @@ export function ChatPage() {
             </div>
           )}
           {messages.map((msg, i) => (
-            <div key={i} className={`message-wrapper ${msg.role}`}>
+            <div key={msg.id ?? `pending-${i}`} className={`message-wrapper ${msg.role}`}>
               <div className={`message-avatar ${msg.role}`}>
-                {msg.role === "human" ? userInitial : "AI"}
+                {msg.role === "human" ? (user?.picture ? <img src={user.picture} alt={user.name} referrerPolicy="no-referrer" /> : (user?.name ? user.name.charAt(0).toUpperCase() : "U")) : <img src="/icons/icon-192.png" alt="Sidekick" />}
               </div>
               <div className={`message ${msg.role}`}>
                 <div className="message-content">{msg.content}</div>
@@ -112,7 +239,7 @@ export function ChatPage() {
           ))}
           {sending && (
             <div className={`message-wrapper ai`}>
-              <div className={`message-avatar ai`}>AI</div>
+              <div className={`message-avatar ai`}><img src="/icons/icon-192.png" alt="Sidekick" /></div>
               <div className={`message ai`}>
                 <div className="message-content">
                   <div className="typing-indicator">
@@ -137,7 +264,7 @@ export function ChatPage() {
             onKeyDown={handleKeyDown}
             placeholder="Type your message..."
             rows={1}
-            disabled={sending}
+            autoFocus
           />
           <button className="send-btn" onClick={sendMessage} disabled={sending || !input.trim()}>
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">

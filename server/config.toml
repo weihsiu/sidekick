@@ -2,9 +2,12 @@
 host = "0.0.0.0"
 port = 3000
 # Public URL the browser sees (used for OAuth redirect URIs).
-base_url = "http://localhost:3000"
-# URL of the frontend app to redirect to after successful login.
-frontend_url = "http://localhost:5173"
+# Public URL the browser sees (used for OAuth redirect URIs).
+# Override with BASE_URL env var.
+base_url = "https://sidekick-server.fly.dev"
+# URL to redirect to after login. Defaults to base_url.
+# Override with FRONTEND_URL env var for local dev (e.g. "http://localhost:5173").
+# frontend_url = "http://localhost:5173"
 
 [auth]
 # Path to the SQLite database for users and sessions.
@@ -24,7 +27,7 @@ client_id = "YOUR_FACEBOOK_APP_ID"
 client_secret_env = "FACEBOOK_CLIENT_SECRET"
 auth_url = "https://www.facebook.com/v19.0/dialog/oauth"
 token_url = "https://graph.facebook.com/v19.0/oauth/access_token"
-userinfo_url = "https://graph.facebook.com/me?fields=id,name,email"
+userinfo_url = "https://graph.facebook.com/me?fields=id,name,email,first_name,last_name,picture,locale"
 scopes = ["email", "public_profile"]
 
 [llm]
@@ -46,12 +49,12 @@ dimensions = 1536
 # Base directory for per-user LanceDB databases.
 # Each user gets {base_path}/{user_id}.lancedb
 base_path = "data/users"
-table_name = "conversations"
+table_name = "memory"
 # Number of relevant past messages to retrieve per query
 top_k = 10
 # Max number of user DBs to keep open in the LRU pool
 pool_size = 100
-# Number of recent chat messages to keep in the conversation window.
+# Number of recent chat messages to keep in the chat window.
 # These are sent to the LLM as message history for short-term context.
 chat_window = 20
 
@@ -69,8 +72,8 @@ faq = 1.2
 
 [agent]
 # System prompt that defines the agent's persona and behavior.
-# RAG context from past conversations is appended automatically.
+# RAG context from memory is appended automatically.
 system_prompt = """
 You are Sidekick, a helpful AI assistant with long-term memory. \
-You remember past conversations and use them to provide more relevant, \
+You remember past interactions and use them to provide more relevant, \
 personalized responses. Be concise, accurate, and friendly."""

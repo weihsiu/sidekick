@@ -1,5 +1,7 @@
 .env
 /target
 /data
+server/target/
+server/data/
 client/node_modules/
 client/dist/

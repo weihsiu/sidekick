@@ -1,7 +1,6 @@
-/server/target
-/server/.env
-/server/data
-/client/node_modules
-/client/dist
+server/target
+server/.env
+server/data
+client/node_modules
+client/dist
 .git
-.gitignore

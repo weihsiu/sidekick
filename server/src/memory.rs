@@ -17,6 +17,7 @@ use synaptic::store::InMemoryStore;
 use tokio::sync::Mutex;
 
 use crate::config::MemoryConfig;
+use crate::history::MemoryHistory;
 use crate::rerank::Reranker;
 
 /// A single entry stored in memory.
@@ -42,14 +43,14 @@ fn default_role() -> String {
     "system".to_string()
 }
 
-/// Persistent conversation memory backed by LanceDB.
+/// Persistent semantic memory backed by LanceDB.
 ///
 /// Thread-safe: a write lock serialises `store` and FTS index rebuilds,
 /// while reads proceed concurrently without contention.
 ///
-/// Also holds a `ConversationWindowMemory` for short-term chat context
-/// (last N messages sent to the LLM as message history).
-pub struct ConversationMemory {
+/// Also holds a short-term chat window (last N messages sent to the LLM
+/// as message history).
+pub struct SemanticMemory {
     table: lancedb::Table,
     embeddings: Arc<dyn Embeddings>,
     reranker: Arc<dyn Reranker>,
@@ -59,12 +60,12 @@ pub struct ConversationMemory {
     category_weights: HashMap<String, f32>,
     /// Serialises writes so concurrent `store` calls don't race on FTS rebuilds.
     write_lock: Mutex<()>,
-    /// Short-term chat window backed by synaptic's ConversationWindowMemory.
+    /// Short-term chat window backed by synaptic's conversation window.
     pub chat_memory: Arc<ConversationWindowMemory>,
 }
 
-impl ConversationMemory {
-    /// Connect to (or create) the LanceDB table for conversation memory.
+impl SemanticMemory {
+    /// Connect to (or create) the LanceDB table for semantic memory.
     pub async fn new(
         db_path: &str,
         table_name: &str,
@@ -200,8 +201,13 @@ impl ConversationMemory {
         Ok(())
     }
 
-    /// Import entries from a JSONL file. Rebuilds the FTS index once at the end.
-    pub async fn import_jsonl(&self, path: &std::path::Path) -> Result<usize> {
+    /// Import entries from a JSONL file. Writes to both LanceDB and the
+    /// SQLite memory history. Rebuilds the FTS index once at the end.
+    pub async fn import_jsonl(
+        &self,
+        path: &std::path::Path,
+        history: &MemoryHistory,
+    ) -> Result<usize> {
         let file_content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read import file: {}", path.display()))?;
         let timestamp = chrono::Utc::now().to_rfc3339();
@@ -233,6 +239,11 @@ impl ConversationMemory {
                 embedding,
             )
             .await?;
+
+            history
+                .append(&record.category, &record.role, &record.content, &timestamp)
+                .await
+                .with_context(|| format!("history insert failed on line {}", line_num + 1))?;
 
             count += 1;
         }
@@ -351,13 +362,21 @@ impl ConversationMemory {
     }
 }
 
-/// LRU pool of per-user `ConversationMemory` instances.
+/// Per-user memory bundle: LanceDB (semantic search) + SQLite (browsing/history).
 ///
-/// Opening a LanceDB is relatively cheap but holds file descriptors, so we
-/// cap the number of concurrently-open databases and evict the least-recently-
-/// used ones.
+/// Both databases are opened and evicted together so a single LRU slot
+/// controls the file-handle footprint for each user.
+pub struct UserMemory {
+    pub semantic: SemanticMemory,
+    pub history: MemoryHistory,
+}
+
+/// LRU pool of per-user `UserMemory` instances.
+///
+/// Opening databases holds file descriptors, so we cap the number of
+/// concurrently-open users and evict the least-recently-used ones.
 pub struct MemoryPool {
-    cache: Mutex<LruCache<String, Arc<ConversationMemory>>>,
+    cache: Mutex<LruCache<String, Arc<UserMemory>>>,
     base_path: String,
     table_name: String,
     top_k: usize,
@@ -398,8 +417,8 @@ impl MemoryPool {
         })
     }
 
-    /// Get or create a `ConversationMemory` for the given user.
-    pub async fn get(&self, user_id: &str) -> Result<Arc<ConversationMemory>> {
+    /// Get or create a `UserMemory` for the given user.
+    pub async fn get(&self, user_id: &str) -> Result<Arc<UserMemory>> {
         // Fast path: check the cache.
         {
             let mut cache = self.cache.lock().await;
@@ -408,33 +427,37 @@ impl MemoryPool {
             }
         }
 
-        // Slow path: open/create the DB outside the cache lock.
-        let db_path = format!("{}/{}.lancedb", self.base_path, user_id);
-        let mem = Arc::new(
-            ConversationMemory::new(
-                &db_path,
-                &self.table_name,
-                Arc::clone(&self.embeddings),
-                Arc::clone(&self.reranker),
-                self.dim,
-                self.top_k,
-                self.rerank_top_n,
-                self.category_weights.clone(),
-                self.chat_window_size,
-            )
+        // Slow path: open/create both databases outside the cache lock.
+        let lance_path = format!("{}/{}.lancedb", self.base_path, user_id);
+        let sqlite_path = format!("{}/{}.memory.db", self.base_path, user_id);
+
+        let semantic = SemanticMemory::new(
+            &lance_path,
+            &self.table_name,
+            Arc::clone(&self.embeddings),
+            Arc::clone(&self.reranker),
+            self.dim,
+            self.top_k,
+            self.rerank_top_n,
+            self.category_weights.clone(),
+            self.chat_window_size,
+        )
+        .await
+        .with_context(|| format!("failed to open semantic memory for user '{user_id}'"))?;
+
+        let history = MemoryHistory::new(&sqlite_path)
             .await
-            .with_context(|| format!("failed to open memory for user '{user_id}'"))?,
-        );
+            .with_context(|| format!("failed to open memory history for user '{user_id}'"))?;
+
+        let user_mem = Arc::new(UserMemory { semantic, history });
 
         let mut cache = self.cache.lock().await;
-        // Another task may have inserted while we were creating — use their
-        // instance if so.
         if let Some(existing) = cache.get(user_id) {
             return Ok(Arc::clone(existing));
         }
-        cache.put(user_id.to_string(), Arc::clone(&mem));
+        cache.put(user_id.to_string(), Arc::clone(&user_mem));
 
-        Ok(mem)
+        Ok(user_mem)
     }
 }
 

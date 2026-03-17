@@ -1,0 +1,27 @@
+app = "sidekick-server"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "flyio/Dockerfile"
+
+[env]
+  RUST_LOG = "sidekick_server=info,tower_http=info"
+  SIDEKICK_CONFIG = "config.toml"
+  BASE_URL = "https://sidekick-server.fly.dev"
+  FRONTEND_URL = "https://sidekick-server.fly.dev"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "sidekick_data"
+  destination = "/app/data"
