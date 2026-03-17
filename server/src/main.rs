@@ -16,7 +16,6 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum_login::login_required;
 use axum_login::{AuthManagerLayerBuilder, AuthSession};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -30,9 +29,14 @@ use axum_extra::extract::cookie::Key;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{MemoryStore as SessionMemoryStore, SessionManagerLayer};
 
+use axum_extra::extract::cookie::PrivateCookieJar;
+
 use auth::AuthBackend;
+use auth::routes::require_user;
 use error::ApiError;
 use memory::{format_context, MemoryPool};
+
+type Jar = PrivateCookieJar<CookieKey>;
 use dotenvy::dotenv;
 
 #[derive(RustEmbed)]
@@ -99,6 +103,8 @@ struct StoreRequest {
     category: String,
     role: String,
     content: String,
+    #[serde(default = "default_importance")]
+    importance: f32,
 }
 
 #[derive(Deserialize)]
@@ -134,15 +140,50 @@ struct HistoryQuery {
 }
 
 // ---------------------------------------------------------------------------
+// Structured LLM response parsing
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct StructuredLlmResponse {
+    response: String,
+    #[serde(default = "default_importance")]
+    importance: f32,
+}
+
+fn default_importance() -> f32 {
+    5.0
+}
+
+/// Parse the LLM output as JSON `{"response": "...", "importance": N}`.
+/// Falls back to treating the entire string as the response with default importance.
+fn parse_structured_response(raw: &str) -> (String, f32) {
+    // Try parsing the raw output as JSON first.
+    if let Ok(parsed) = serde_json::from_str::<StructuredLlmResponse>(raw) {
+        return (parsed.response, parsed.importance.clamp(1.0, 10.0));
+    }
+    // If the LLM wrapped JSON in a markdown code block, try extracting it.
+    if let Some(start) = raw.find('{') {
+        if let Some(end) = raw.rfind('}') {
+            if let Ok(parsed) = serde_json::from_str::<StructuredLlmResponse>(&raw[start..=end]) {
+                return (parsed.response, parsed.importance.clamp(1.0, 10.0));
+            }
+        }
+    }
+    // Fallback: treat entire output as the response.
+    (raw.to_string(), 5.0)
+}
+
+// ---------------------------------------------------------------------------
 // Handlers (user_id comes from the authenticated session)
 // ---------------------------------------------------------------------------
 
 async fn chat_handler(
-    auth_session: AuthSession<AuthBackend>,
+    mut auth_session: AuthSession<AuthBackend>,
+    jar: Jar,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = auth_session.user.ok_or(ApiError::Unauthorized)?;
+    let user = require_user(&mut auth_session, &jar).await?;
     let user_id = &user.id;
 
     let user_mem = state.pool.get(user_id).await?;
@@ -177,18 +218,24 @@ async fn chat_handler(
         .context("LLM invocation failed")?;
     let final_state: &MessageState = result.state();
 
-    let response = final_state
+    let raw = final_state
         .last_message()
         .map(|m: &Message| m.content().to_string())
         .unwrap_or_default();
 
-    // Persist both sides to long-term memory (LanceDB), history (SQLite),
-    // and the chat window.
+    // Parse structured response: {"response": "...", "importance": N}
+    // Fall back to treating the entire output as the response with default importance.
+    let (response, importance) = parse_structured_response(&raw);
+    tracing::info!(importance = importance, "chat response importance");
+
+    // Persist to long-term memory (LanceDB) as a single combined entry,
+    // to history (SQLite) as two separate entries for display,
+    // and to the chat window for short-term context.
     let now = chrono::Utc::now().to_rfc3339();
-    user_mem.semantic.store("conversation", "human", &req.message).await?;
-    user_mem.semantic.store("conversation", "ai", &response).await?;
-    user_mem.history.append("conversation", "human", &req.message, &now).await?;
-    user_mem.history.append("conversation", "ai", &response, &now).await?;
+    let combined = format!("User: {}\nAssistant: {}", req.message, response);
+    user_mem.semantic.store("conversation", "conversation", &combined, importance).await?;
+    user_mem.history.append("conversation", "human", &req.message, &now, importance).await?;
+    user_mem.history.append("conversation", "ai", &response, &now, importance).await?;
     user_mem.semantic.chat_memory
         .append(user_id, Message::human(&req.message))
         .await
@@ -202,15 +249,16 @@ async fn chat_handler(
 }
 
 async fn store_handler(
-    auth_session: AuthSession<AuthBackend>,
+    mut auth_session: AuthSession<AuthBackend>,
+    jar: Jar,
     State(state): State<Arc<AppState>>,
     Json(req): Json<StoreRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = auth_session.user.ok_or(ApiError::Unauthorized)?;
+    let user = require_user(&mut auth_session, &jar).await?;
     let user_mem = state.pool.get(&user.id).await?;
-    user_mem.semantic.store(&req.category, &req.role, &req.content).await?;
+    user_mem.semantic.store(&req.category, &req.role, &req.content, req.importance).await?;
     let now = chrono::Utc::now().to_rfc3339();
-    user_mem.history.append(&req.category, &req.role, &req.content, &now).await?;
+    user_mem.history.append(&req.category, &req.role, &req.content, &now, req.importance).await?;
 
     Ok(Json(MessageResponse {
         message: "stored".to_string(),
@@ -218,11 +266,12 @@ async fn store_handler(
 }
 
 async fn search_handler(
-    auth_session: AuthSession<AuthBackend>,
+    mut auth_session: AuthSession<AuthBackend>,
+    jar: Jar,
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = auth_session.user.ok_or(ApiError::Unauthorized)?;
+    let user = require_user(&mut auth_session, &jar).await?;
     let user_mem = state.pool.get(&user.id).await?;
 
     let cat_refs: Option<Vec<&str>> = req
@@ -246,12 +295,32 @@ async fn search_handler(
 }
 
 async fn history_handler(
-    auth_session: AuthSession<AuthBackend>,
+    mut auth_session: AuthSession<AuthBackend>,
+    jar: Jar,
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<HistoryQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user = auth_session.user.ok_or(ApiError::Unauthorized)?;
+    let user = require_user(&mut auth_session, &jar).await?;
     let user_mem = state.pool.get(&user.id).await?;
+
+    // First-time user: store their name as knowledge and add a welcome message.
+    if user_mem.history.is_empty().await? {
+        let name_fact = format!("The user's name is {}.", user.name);
+        let now = chrono::Utc::now().to_rfc3339();
+        user_mem.semantic.store("knowledge", "system", &name_fact, 10.0).await?;
+        user_mem.history.append("knowledge", "system", &name_fact, &now, 10.0).await?;
+
+        let welcome = format!(
+            "Welcome to Sidekick, {}! I'm your AI assistant with long-term memory. How can I help you today?",
+            user.first_name
+        );
+        user_mem.history.append("conversation", "ai", &welcome, &now, 1.0).await?;
+        user_mem.semantic.chat_memory
+            .append(&user.id, Message::ai(&welcome))
+            .await
+            .context("failed to append welcome message")?;
+    }
+
     let limit = params.limit.unwrap_or(20).min(100);
     let category = params.category.as_deref();
     let entries = user_mem.history.fetch(params.before, limit, category).await?;
@@ -388,7 +457,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/memory/store", post(store_handler))
         .route("/v1/memory/search", post(search_handler))
         .route("/v1/history", get(history_handler))
-        .route_layer(login_required!(AuthBackend))
         .with_state(state.clone());
 
     // Auth routes (public).

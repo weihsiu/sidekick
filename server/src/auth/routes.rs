@@ -9,11 +9,30 @@ use axum_login::AuthSession;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
-use crate::user;
+use crate::user::{self, User};
 
 use super::AuthBackend;
 
 const REMEMBER_COOKIE: &str = "sidekick_remember";
+
+/// Extract the authenticated user from session or remember cookie.
+///
+/// If the in-memory session is gone (e.g. server restart), falls back to the
+/// encrypted remember cookie to restore the session transparently.
+pub async fn require_user(
+    auth_session: &mut AuthSession<AuthBackend>,
+    jar: &Jar,
+) -> Result<User, ApiError> {
+    if auth_session.user.is_none() {
+        if let Some(cookie) = jar.get(REMEMBER_COOKIE) {
+            let user_id = cookie.value();
+            if let Ok(Some(u)) = user::find_by_id(&auth_session.backend.db, user_id).await {
+                let _ = auth_session.login(&u).await;
+            }
+        }
+    }
+    auth_session.user.clone().ok_or(ApiError::Unauthorized)
+}
 
 #[derive(Deserialize)]
 pub struct CallbackParams {
@@ -133,19 +152,7 @@ pub async fn me(
     mut auth_session: AuthSession<AuthBackend>,
     jar: Jar,
 ) -> Result<impl IntoResponse, ApiError> {
-    // If no active session, try restoring from the remember cookie.
-    if auth_session.user.is_none() {
-        if let Some(cookie) = jar.get(REMEMBER_COOKIE) {
-            let user_id = cookie.value();
-            if let Ok(Some(u)) = user::find_by_id(&auth_session.backend.db, user_id).await {
-                let _ = auth_session.login(&u).await;
-            }
-        }
-    }
-
-    let user = auth_session
-        .user
-        .ok_or(ApiError::Unauthorized)?;
+    let user = require_user(&mut auth_session, &jar).await?;
 
     let providers: Vec<String> = sqlx::query_scalar(
         "SELECT provider FROM user_providers WHERE user_id = ?",

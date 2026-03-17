@@ -11,6 +11,7 @@ pub struct HistoryEntry {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    pub importance: f32,
 }
 
 /// Per-user memory history backed by SQLite.
@@ -36,11 +37,12 @@ impl MemoryHistory {
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                category  TEXT NOT NULL,
-                role      TEXT NOT NULL,
-                content   TEXT NOT NULL,
-                timestamp TEXT NOT NULL
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                category   TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                timestamp  TEXT NOT NULL,
+                importance REAL NOT NULL DEFAULT 5.0
             )",
         )
         .execute(&db)
@@ -57,20 +59,31 @@ impl MemoryHistory {
         role: &str,
         content: &str,
         timestamp: &str,
+        importance: f32,
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO memory (category, role, content, timestamp)
-             VALUES (?, ?, ?, ?) RETURNING id",
+            "INSERT INTO memory (category, role, content, timestamp, importance)
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(category)
         .bind(role)
         .bind(content)
         .bind(timestamp)
+        .bind(importance)
         .fetch_one(&self.db)
         .await
         .context("failed to insert memory history entry")?;
 
         Ok(row.0)
+    }
+
+    /// Returns true if the memory table has no entries.
+    pub async fn is_empty(&self) -> Result<bool> {
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM memory")
+            .fetch_one(&self.db)
+            .await
+            .context("failed to count memory entries")?;
+        Ok(count.0 == 0)
     }
 
     /// Fetch entries for infinite scroll, optionally filtered by category.
@@ -88,10 +101,10 @@ impl MemoryHistory {
         limit: i64,
         category: Option<&str>,
     ) -> Result<Vec<HistoryEntry>> {
-        let rows: Vec<(i64, String, String, String, String)> = match (before, category) {
+        let rows: Vec<(i64, String, String, String, String, f32)> = match (before, category) {
             (Some(cursor), Some(cat)) => {
                 sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp FROM memory
+                    "SELECT id, category, role, content, timestamp, importance FROM memory
                      WHERE id < ? AND category = ? ORDER BY id DESC LIMIT ?",
                 )
                 .bind(cursor)
@@ -102,7 +115,7 @@ impl MemoryHistory {
             }
             (Some(cursor), None) => {
                 sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp FROM memory
+                    "SELECT id, category, role, content, timestamp, importance FROM memory
                      WHERE id < ? ORDER BY id DESC LIMIT ?",
                 )
                 .bind(cursor)
@@ -112,7 +125,7 @@ impl MemoryHistory {
             }
             (None, Some(cat)) => {
                 sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp FROM memory
+                    "SELECT id, category, role, content, timestamp, importance FROM memory
                      WHERE category = ? ORDER BY id DESC LIMIT ?",
                 )
                 .bind(cat)
@@ -122,7 +135,7 @@ impl MemoryHistory {
             }
             (None, None) => {
                 sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp FROM memory
+                    "SELECT id, category, role, content, timestamp, importance FROM memory
                      ORDER BY id DESC LIMIT ?",
                 )
                 .bind(limit)
@@ -133,12 +146,13 @@ impl MemoryHistory {
 
         let mut entries: Vec<HistoryEntry> = rows
             .into_iter()
-            .map(|(id, category, role, content, timestamp)| HistoryEntry {
+            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
                 id,
                 category,
                 role,
                 content,
                 timestamp,
+                importance,
             })
             .collect();
         entries.reverse();

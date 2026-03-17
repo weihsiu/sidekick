@@ -76,51 +76,25 @@ export function ChatPage() {
     prevMessageCount.current = messages.length;
   }, [messages.length]);
 
-  // Smart header: detect user gesture direction directly.
+  // Smart header: show when scrolling up, hide when scrolling down.
+  const lastScrollTop = useRef(0);
   useEffect(() => {
     const container = messagesContainerRef.current;
     const header = headerRef.current;
     if (!container || !header) return;
 
-    let touchStartY = 0;
-
-    // Wheel: deltaY > 0 = wheel/trackpad scroll "down" (content moves up)
-    const onWheel = (e: WheelEvent) => {
-      if (Math.abs(e.deltaY) < 5) return;
-      if (e.deltaY < 0) {
-        // Scrolling up through content (finger/wheel moving down)
-        header.classList.remove("chat-header-hidden");
-      } else {
-        // Scrolling down through content (finger/wheel moving up)
+    const onScroll = () => {
+      const st = container.scrollTop;
+      if (st > lastScrollTop.current + 5) {
         header.classList.add("chat-header-hidden");
-      }
-    };
-
-    const onTouchStart = (e: TouchEvent) => {
-      touchStartY = e.touches[0].clientY;
-    };
-
-    const onTouchMove = (e: TouchEvent) => {
-      const delta = e.touches[0].clientY - touchStartY;
-      if (Math.abs(delta) < 10) return;
-      if (delta > 0) {
-        // Finger dragging down — viewing older content
+      } else if (st < lastScrollTop.current - 5) {
         header.classList.remove("chat-header-hidden");
-      } else {
-        // Finger dragging up — viewing newer content
-        header.classList.add("chat-header-hidden");
       }
-      touchStartY = e.touches[0].clientY;
+      lastScrollTop.current = st;
     };
 
-    container.addEventListener("wheel", onWheel, { passive: true });
-    container.addEventListener("touchstart", onTouchStart, { passive: true });
-    container.addEventListener("touchmove", onTouchMove, { passive: true });
-    return () => {
-      container.removeEventListener("wheel", onWheel);
-      container.removeEventListener("touchstart", onTouchStart);
-      container.removeEventListener("touchmove", onTouchMove);
-    };
+    container.addEventListener("scroll", onScroll, { passive: true });
+    return () => container.removeEventListener("scroll", onScroll);
   }, []);
 
   // Infinite scroll — load older messages when scrolling to top.

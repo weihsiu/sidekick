@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::types::Float32Type;
-use arrow_array::{FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance_index::scalar::FullTextSearchQuery;
@@ -27,6 +27,7 @@ pub struct MemoryEntry {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+    pub importance: f32,
 }
 
 /// A record in a JSONL import file.
@@ -37,10 +38,17 @@ pub struct ImportRecord {
     /// Optional role — defaults to "system" for imported knowledge.
     #[serde(default = "default_role")]
     pub role: String,
+    /// Optional importance — defaults to 5.0.
+    #[serde(default = "default_importance")]
+    pub importance: f32,
 }
 
 fn default_role() -> String {
     "system".to_string()
+}
+
+fn default_importance() -> f32 {
+    5.0
 }
 
 /// Persistent semantic memory backed by LanceDB.
@@ -125,6 +133,7 @@ impl SemanticMemory {
             Field::new("role", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
             Field::new("timestamp", DataType::Utf8, false),
+            Field::new("importance", DataType::Float32, false),
             Field::new(
                 "vector",
                 DataType::FixedSizeList(
@@ -148,7 +157,13 @@ impl SemanticMemory {
     }
 
     /// Store a single entry in memory (thread-safe).
-    pub async fn store(&self, category: &str, role: &str, content: &str) -> Result<()> {
+    pub async fn store(
+        &self,
+        category: &str,
+        role: &str,
+        content: &str,
+        importance: f32,
+    ) -> Result<()> {
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().to_rfc3339();
 
@@ -160,7 +175,7 @@ impl SemanticMemory {
             .context("failed to compute embedding")?;
 
         let _guard = self.write_lock.lock().await;
-        self.insert_row(category, role, content, &id, &timestamp, embedding)
+        self.insert_row(category, role, content, &id, &timestamp, importance, embedding)
             .await?;
         self.rebuild_fts_index().await?;
 
@@ -175,6 +190,7 @@ impl SemanticMemory {
         content: &str,
         id: &str,
         timestamp: &str,
+        importance: f32,
         embedding: Vec<f32>,
     ) -> Result<()> {
         let schema = Self::schema(self.dim);
@@ -186,6 +202,7 @@ impl SemanticMemory {
                 Arc::new(StringArray::from(vec![role])),
                 Arc::new(StringArray::from(vec![content])),
                 Arc::new(StringArray::from(vec![timestamp])),
+                Arc::new(Float32Array::from(vec![importance])),
                 Arc::new(
                     FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                         vec![Some(embedding.into_iter().map(Some).collect::<Vec<_>>())],
@@ -236,12 +253,13 @@ impl SemanticMemory {
                 &record.content,
                 &id,
                 &timestamp,
+                record.importance,
                 embedding,
             )
             .await?;
 
             history
-                .append(&record.category, &record.role, &record.content, &timestamp)
+                .append(&record.category, &record.role, &record.content, &timestamp, record.importance)
                 .await
                 .with_context(|| format!("history insert failed on line {}", line_num + 1))?;
 
@@ -327,6 +345,12 @@ impl SemanticMemory {
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
+            let importances = batch
+                .column_by_name("importance")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap();
 
             for i in 0..batch.num_rows() {
                 entries.push(MemoryEntry {
@@ -334,20 +358,24 @@ impl SemanticMemory {
                     role: roles.value(i).to_string(),
                     content: contents.value(i).to_string(),
                     timestamp: timestamps.value(i).to_string(),
+                    importance: importances.value(i),
                 });
             }
         }
 
-        // Rerank to surface the most relevant entries, then apply category weights.
+        // Rerank to surface the most relevant entries, then apply category and importance weights.
         let docs: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
         let mut ranked = self.reranker.rerank(query, &docs, entries.len()).await?;
         for r in &mut ranked {
-            let weight = self
+            let cat_weight = self
                 .category_weights
                 .get(&entries[r.index].category)
                 .copied()
                 .unwrap_or(1.0);
-            r.score *= weight;
+            // Normalize importance (1-10) to a multiplier (0.5-1.5).
+            let imp = entries[r.index].importance.clamp(1.0, 10.0);
+            let imp_weight = 0.5 + (imp - 1.0) / 9.0;
+            r.score *= cat_weight * imp_weight;
         }
         ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(self.rerank_top_n);
