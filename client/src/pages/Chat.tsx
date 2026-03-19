@@ -1,10 +1,30 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import Markdown from "react-markdown";
 import { useAuth } from "../auth";
 
 interface Message {
   id?: number;
   role: "human" | "ai";
   content: string;
+  timestamp?: string;
+}
+
+function formatTimestamp(ts: string): string {
+  const date = new Date(ts);
+  const now = new Date();
+  const isToday =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  const isThisYear = date.getFullYear() === now.getFullYear();
+
+  if (isToday) {
+    return date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  } else if (isThisYear) {
+    return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  } else {
+    return date.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  }
 }
 
 const PAGE_SIZE = 20;
@@ -123,18 +143,19 @@ export function ChatPage() {
       textareaRef.current.style.height = "auto";
     }
 
-    setMessages((prev) => [...prev, { role: "human", content: text }]);
+    setMessages((prev) => [...prev, { role: "human", content: text, timestamp: new Date().toISOString() }]);
     setSending(true);
 
     try {
       const res = await fetch("/v1/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, local_time: new Date().toString() }),
       });
 
       if (!res.ok) {
         const err = await res.text();
+        console.error(`Chat API error (${res.status}):`, err);
         setMessages((prev) => [
           ...prev,
           { role: "ai", content: `Error: ${err}` },
@@ -145,9 +166,10 @@ export function ChatPage() {
       const data = await res.json();
       setMessages((prev) => [
         ...prev,
-        { role: "ai", content: data.response },
+        { role: "ai", content: data.response, timestamp: new Date().toISOString() },
       ]);
     } catch (err) {
+      console.error("Chat network error:", err);
       setMessages((prev) => [
         ...prev,
         { role: "ai", content: `Network error: ${err}` },
@@ -207,7 +229,10 @@ export function ChatPage() {
                 {msg.role === "human" ? (user?.picture ? <img src={user.picture} alt={user.name} referrerPolicy="no-referrer" /> : (user?.name ? user.name.charAt(0).toUpperCase() : "U")) : <img src="/icons/icon-192.png" alt="Sidekick" />}
               </div>
               <div className={`message ${msg.role}`}>
-                <div className="message-content">{msg.content}</div>
+                <div className="message-content">
+                  {msg.role === "ai" ? <Markdown>{msg.content}</Markdown> : msg.content}
+                </div>
+                {msg.timestamp && <div className="message-time">{formatTimestamp(msg.timestamp)}</div>}
               </div>
             </div>
           ))}

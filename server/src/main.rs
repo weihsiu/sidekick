@@ -1,15 +1,18 @@
 mod auth;
 mod config;
+mod context;
 mod embeddings;
 mod error;
 mod history;
 mod memory;
 mod provider;
 mod rerank;
+mod tools;
 mod user;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Context;
 use axum::extract::State;
@@ -34,7 +37,7 @@ use axum_extra::extract::cookie::PrivateCookieJar;
 use auth::AuthBackend;
 use auth::routes::require_user;
 use error::ApiError;
-use memory::{format_context, MemoryPool};
+use memory::MemoryPool;
 
 type Jar = PrivateCookieJar<CookieKey>;
 use dotenvy::dotenv;
@@ -50,12 +53,33 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            (StatusCode::OK, [(header::CONTENT_TYPE, mime.as_ref().to_string())], content.data.to_vec()).into_response()
+            // index.html and SW must never be cached — they reference hashed assets.
+            // Hashed assets (JS/CSS under assets/) are immutable and safe to cache forever.
+            let cache_control = if path == "index.html" || path == "sw.js" {
+                "no-store"
+            } else {
+                "public, max-age=31536000, immutable"
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                    (header::CACHE_CONTROL, cache_control.to_string()),
+                ],
+                content.data.to_vec(),
+            )
+                .into_response()
         }
         None => match Assets::get("index.html") {
-            Some(content) => {
-                (StatusCode::OK, [(header::CONTENT_TYPE, "text/html".to_string())], content.data.to_vec()).into_response()
-            }
+            Some(content) => (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "text/html".to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                content.data.to_vec(),
+            )
+                .into_response(),
             None => StatusCode::NOT_FOUND.into_response(),
         },
     }
@@ -72,10 +96,12 @@ impl From<CookieKey> for Key {
 }
 
 struct AppState {
-    pool: MemoryPool,
+    pool: Arc<MemoryPool>,
     graph: CompiledGraph<MessageState>,
     system_prompt: String,
     cookie_key: CookieKey,
+    /// Shared failure counter for tool retries — reset before each graph.invoke().
+    tool_failure_count: Arc<AtomicUsize>,
 }
 
 impl axum::extract::FromRef<Arc<AppState>> for CookieKey {
@@ -91,6 +117,7 @@ impl axum::extract::FromRef<Arc<AppState>> for CookieKey {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
+    local_time: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -188,17 +215,13 @@ async fn chat_handler(
 
     let user_mem = state.pool.get(user_id).await?;
 
-    // Retrieve relevant context from this user's memory.
-    let context_entries = user_mem.semantic.retrieve(&req.message, None).await?;
-    let context = format_context(&context_entries);
-
-    let system_prompt = if context.is_empty() {
-        state.system_prompt.clone()
-    } else {
-        format!("{}\n\n{}", state.system_prompt, context)
-    };
-
     // Build message list: system prompt + recent chat window + current message.
+    // Long-term memory is accessed via the recall_memory tool, not pre-injected.
+    tracing::info!(local_time = ?req.local_time, "building system prompt");
+    let system_prompt = match &req.local_time {
+        Some(t) => format!("{}\n\nUser's current date and time: {}", state.system_prompt, t),
+        None => format!("{}\n\nCurrent date and time (UTC): {}", state.system_prompt, chrono::Utc::now().format("%A, %B %-d, %Y %H:%M UTC")),
+    };
     let mut messages = vec![Message::system(&system_prompt)];
     let history = user_mem
         .semantic
@@ -211,9 +234,12 @@ async fn chat_handler(
 
     let msg_state = MessageState { messages };
 
-    let result = state
-        .graph
-        .invoke(msg_state)
+    // Reset the shared tool failure counter for this conversation turn.
+    state.tool_failure_count.store(0, Ordering::SeqCst);
+
+    let user_id_owned = user_id.to_string();
+    let result = context::CURRENT_USER_ID
+        .scope(user_id_owned, state.graph.invoke(msg_state))
         .await
         .context("LLM invocation failed")?;
     let final_state: &MessageState = result.state();
@@ -226,7 +252,7 @@ async fn chat_handler(
     // Parse structured response: {"response": "...", "importance": N}
     // Fall back to treating the entire output as the response with default importance.
     let (response, importance) = parse_structured_response(&raw);
-    tracing::info!(importance = importance, "chat response importance");
+    tracing::debug!(importance = importance, "chat response importance");
 
     // Persist to long-term memory (LanceDB) as a single combined entry,
     // to history (SQLite) as two separate entries for display,
@@ -432,22 +458,52 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let model = provider::build_model(&cfg.llm)?;
-    let graph = create_react_agent(model, vec![]).context("failed to create agent")?;
 
-    let pool = memory::MemoryPool::new(
+    let pool = Arc::new(memory::MemoryPool::new(
         &cfg.memory,
         emb,
         reranker,
         cfg.embeddings.dimensions,
         cfg.rerank.top_n,
         cfg.rerank.category_weights,
-    )?;
+    )?);
+
+    // --- Tools ---
+    // Wrap each tool with RetryAwareTool so tool errors are returned to the LLM
+    // as messages (allowing it to retry or inform the user) instead of aborting
+    // the graph. A shared failure counter limits total retries per conversation turn.
+    let tool_failure_count = Arc::new(AtomicUsize::new(0));
+    let max_tool_retries = cfg.agent.max_tool_retries;
+    let mut all_tools: Vec<Arc<dyn synaptic::core::Tool>> = vec![
+        tools::recall_memory::RecallMemory::new(pool.clone()),
+    ];
+    if let Some(google_config) = cfg.auth.providers.get("google") {
+        let api = tools::google_api::GoogleApiClient::new(db.clone(), google_config)?;
+        let mut t = tools::google_calendar::create_tools(api.clone());
+        t.extend(tools::gmail::create_tools(api.clone()));
+        t.extend(tools::google_tasks::create_tools(api.clone()));
+        t.extend(tools::google_people::create_tools(api));
+        all_tools.extend(t);
+    }
+    let all_tools: Vec<Arc<dyn synaptic::core::Tool>> = all_tools
+        .into_iter()
+        .map(|tool| {
+            tools::retry_wrapper::RetryAwareTool::wrap(
+                tool,
+                tool_failure_count.clone(),
+                max_tool_retries,
+            )
+        })
+        .collect();
+
+    let graph = create_react_agent(model, all_tools).context("failed to create agent")?;
 
     let state = Arc::new(AppState {
         pool,
         graph,
         system_prompt: cfg.agent.system_prompt,
         cookie_key: CookieKey(cookie_key),
+        tool_failure_count,
     });
 
     // --- Routes ---

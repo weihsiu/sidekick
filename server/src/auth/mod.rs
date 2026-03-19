@@ -1,5 +1,6 @@
 pub mod oauth;
 pub mod routes;
+pub mod tokens;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,19 +85,31 @@ impl AuthnBackend for AuthBackend {
                 .with_context(|| format!("unknown OAuth provider: {}", creds.provider))?;
 
             // Exchange the auth code for tokens and fetch user info.
-            let user_info = provider.exchange_code(&creds.code, None).await?;
+            let oauth_result = provider.exchange_code(&creds.code, None).await?;
 
             // Find or create the user in our database.
             let user = user::find_or_create(
                 &db,
                 &creds.provider,
-                &user_info.id,
-                &user_info.name,
-                &user_info.email,
-                &user_info.first_name,
-                &user_info.last_name,
-                &user_info.picture,
-                &user_info.locale,
+                &oauth_result.user_info.id,
+                &oauth_result.user_info.name,
+                &oauth_result.user_info.email,
+                &oauth_result.user_info.first_name,
+                &oauth_result.user_info.last_name,
+                &oauth_result.user_info.picture,
+                &oauth_result.user_info.locale,
+            )
+            .await?;
+
+            // Persist OAuth tokens for API access.
+            tokens::save_tokens(
+                &db,
+                &user.id,
+                &creds.provider,
+                &oauth_result.access_token,
+                oauth_result.refresh_token.as_deref(),
+                oauth_result.expires_at.as_deref(),
+                &oauth_result.scopes,
             )
             .await?;
 

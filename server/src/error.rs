@@ -20,7 +20,10 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "not authenticated".to_string()),
+            ApiError::Unauthorized => {
+                tracing::warn!("unauthorized request");
+                (StatusCode::UNAUTHORIZED, "not authenticated".to_string())
+            }
             ApiError::Internal(err) => {
                 tracing::error!(error = %err, "request failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}"))

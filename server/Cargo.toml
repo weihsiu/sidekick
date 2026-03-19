@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-synaptic = { version = "0.4", features = ["agent", "model-utils", "memory", "store", "openai", "anthropic", "ollama", "gemini"] }
+synaptic = { version = "0.4", features = ["agent", "model-utils", "memory", "store", "tools", "openai", "anthropic", "ollama", "gemini"] }
 lancedb = "0.26"
 lance-index = "2.0"
 arrow-array = "57"
@@ -34,3 +34,5 @@ dotenvy = "0.15"
 rust-embed = "8.11.0"
 mime_guess = "2.0.5"
 axum-extra = { version = "0.12.5", features = ["cookie-private"] }
+urlencoding = "2"
+base64 = "0.22"

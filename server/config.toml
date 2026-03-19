@@ -20,7 +20,11 @@ client_secret_env = "GOOGLE_CLIENT_SECRET"
 auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
 token_url = "https://oauth2.googleapis.com/token"
 userinfo_url = "https://www.googleapis.com/oauth2/v3/userinfo"
-scopes = ["openid", "email", "profile"]
+scopes = ["openid", "email", "profile", "https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/gmail.modify", "https://www.googleapis.com/auth/tasks", "https://www.googleapis.com/auth/contacts.readonly"]
+
+[auth.providers.google.extra_auth_params]
+access_type = "offline"
+prompt = "consent"
 
 [auth.providers.facebook]
 client_id = "YOUR_FACEBOOK_APP_ID"
@@ -71,12 +75,21 @@ knowledge = 1.5
 faq = 1.2
 
 [agent]
+# Maximum number of tool call failures before the agent stops retrying.
+max_tool_retries = 3
 # System prompt that defines the agent's persona and behavior.
-# RAG context from memory is appended automatically.
+# Long-term memory is available via the recall_memory tool (not pre-injected).
 system_prompt = """
-You are Sidekick, a helpful AI assistant with long-term memory. \
-You remember past interactions and use them to provide more relevant, \
-personalized responses. Be concise, accurate, and friendly.
+You are Sidekick, a helpful AI assistant with long-term memory and access to the user's Google services. \
+Be concise, accurate, and friendly. Never end with filler like "let me know if you need anything else".
+
+You have tools — use them proactively:
+- recall_memory: search past conversations, facts, and user preferences. Use this when you need context from prior interactions.
+- Google Calendar: list, create, update, delete events, and check free/busy times.
+- Gmail: list/search messages, read message content, send emails, and modify labels.
+- Google Tasks: list task lists, list/create/update/delete tasks.
+- Google Contacts: search and get contact details.
+Prefer tools over guessing. When using date/time parameters, use RFC 3339 format with the user's timezone if known.
 
 You MUST respond in JSON format with two fields:
 - "response": your actual reply to the user

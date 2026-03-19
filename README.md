@@ -481,6 +481,7 @@ The `server/flyio/fly.toml` configures:
 ## Architecture
 
 - **OAuth2 authentication**: Login via Google or Facebook using PKCE flow. User identity stored in SQLite. Sessions managed by tower-sessions (in-memory) with an encrypted "remember me" cookie that survives server restarts and browser closes (30-day expiry). Modular provider config — add new providers by adding a `[auth.providers.<name>]` section.
+- **OAuth token storage**: Access and refresh tokens are persisted per user+provider in the auth SQLite database. Tokens are refreshed automatically (with a 5-minute expiry buffer) so tools can call Google APIs on the user's behalf.
 - **Multi-user**: Each user gets isolated databases at `data/users/{user_id}.lancedb` (semantic) and `data/users/{user_id}.memory.db` (history)
 - **Dual-store memory**: LanceDB for semantic/vector search (RAG retrieval) + SQLite for ordered, cursor-based browsing (infinite scroll). All writes go to both stores.
 - **Memory pool**: A single LRU cache manages both databases per user as one unit, evicting idle users to conserve file descriptors
@@ -488,6 +489,8 @@ The `server/flyio/fly.toml` configures:
 - **Chat window**: Short-term context via Synaptic's `ConversationWindowMemory` for recent conversational continuity
 - **Hybrid retrieval**: Dense vector cosine similarity + full-text keyword matching, fused with Reciprocal Rank Fusion (RRF)
 - **Reranking**: Retrieved results are reranked with configurable category weight boosts
+- **Structured LLM responses**: The agent returns structured JSON with an `importance` score (1–10). High-importance responses are written to long-term memory; low-importance ones are skipped, reducing noise in the memory stores.
+- **Agent tools**: The agent can call tools to act on the user's behalf. Tools read the current user ID from a task-local context set per request, so tool calls in concurrent requests are always isolated to the correct user.
 - **PWA**: Installable progressive web app with service worker caching for offline static assets
 
 ## How it works
@@ -532,6 +535,22 @@ Each entry in a user's SQLite database:
 | `content` | string | Text content |
 | `timestamp` | string | ISO 8601 timestamp |
 
+## Agent tools
+
+The agent has access to the following tools:
+
+| Tool | Description |
+|------|-------------|
+| `recall_memory` | Semantic search over the user's long-term memory |
+| `gmail` | Search and read messages, send email, modify labels |
+| `google_calendar` | List, create, update, and delete calendar events; check availability |
+| `google_tasks` | Manage task lists and individual tasks |
+| `google_contacts` | Search and retrieve contacts from Google People |
+
+Google tools require the user to have granted the relevant OAuth scopes (configured per provider in `config.toml`). Tokens are fetched and refreshed automatically — tools never prompt for re-authentication mid-conversation.
+
+All tools are wrapped with a retry layer that retries on transient failures (default: 3 attempts).
+
 ## Project structure
 
 ```
@@ -541,6 +560,7 @@ server/
   src/
     main.rs               # HTTP server, API handlers, --import CLI
     config.rs             # Config file parsing
+    context.rs            # Task-local CURRENT_USER_ID for per-user tool isolation
     error.rs              # API error types (thiserror + anyhow)
     provider.rs           # Builds the ChatModel from config
     embeddings.rs         # Builds the Embeddings model from config
@@ -552,6 +572,16 @@ server/
       mod.rs              # AuthBackend for axum-login, AuthnBackend impl
       oauth.rs            # OAuth2 provider (PKCE flow, token exchange, userinfo)
       routes.rs           # Login, callback, logout, me handlers
+      tokens.rs           # OAuth token storage and auto-refresh (per user+provider)
+    tools/
+      mod.rs              # Tool registration and shared types
+      google_api.rs       # Shared Google API HTTP client (reads per-user tokens)
+      gmail.rs            # Gmail tool
+      google_calendar.rs  # Google Calendar tool
+      google_tasks.rs     # Google Tasks tool
+      google_people.rs    # Google Contacts tool
+      recall_memory.rs    # Semantic memory recall tool
+      retry_wrapper.rs    # Retry wrapper for transient failures
 client/
   package.json            # React + Vite PWA frontend
   vite.config.ts          # Dev server with API proxy to backend

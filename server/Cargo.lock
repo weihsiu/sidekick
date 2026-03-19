@@ -5396,6 +5396,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "axum-login",
+ "base64",
  "chrono",
  "dotenvy",
  "futures",
@@ -5418,6 +5419,7 @@ dependencies = [
  "tower-sessions",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
  "uuid",
 ]
 

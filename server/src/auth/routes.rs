@@ -91,7 +91,7 @@ pub async fn callback(
         .get_provider(&provider_name)
         .ok_or_else(|| anyhow::anyhow!("unknown OAuth provider: {provider_name}"))?;
 
-    let user_info = provider
+    let oauth_result = provider
         .exchange_code(&params.code, pkce_verifier)
         .await?;
 
@@ -99,13 +99,25 @@ pub async fn callback(
     let user = crate::user::find_or_create(
         &auth_session.backend.db,
         &provider_name,
-        &user_info.id,
-        &user_info.name,
-        &user_info.email,
-        &user_info.first_name,
-        &user_info.last_name,
-        &user_info.picture,
-        &user_info.locale,
+        &oauth_result.user_info.id,
+        &oauth_result.user_info.name,
+        &oauth_result.user_info.email,
+        &oauth_result.user_info.first_name,
+        &oauth_result.user_info.last_name,
+        &oauth_result.user_info.picture,
+        &oauth_result.user_info.locale,
+    )
+    .await?;
+
+    // Persist OAuth tokens for API access (calendar, etc.).
+    super::tokens::save_tokens(
+        &auth_session.backend.db,
+        &user.id,
+        &provider_name,
+        &oauth_result.access_token,
+        oauth_result.refresh_token.as_deref(),
+        oauth_result.expires_at.as_deref(),
+        &oauth_result.scopes,
     )
     .await?;
 

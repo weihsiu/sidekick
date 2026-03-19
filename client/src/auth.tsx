@@ -44,10 +44,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     refresh();
-    // Re-check auth when returning from OAuth redirect or switching tabs.
-    const onFocus = () => refresh();
-    window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
   }, [refresh]);
 
   const logout = useCallback(async () => {

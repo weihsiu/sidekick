@@ -11,6 +11,10 @@ DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 APP_NAME="sidekick-server"
 IMAGE="registry.fly.io/$APP_NAME:latest"
 
+cd "$PROJECT_ROOT/client"
+echo "==> Building client..."
+npm run build
+
 cd "$PROJECT_ROOT"
 
 echo "==> Building Docker image (linux/amd64)..."

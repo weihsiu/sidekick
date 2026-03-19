@@ -49,6 +49,10 @@ pub struct OAuthProviderConfig {
     pub userinfo_url: String,
     /// OAuth scopes to request.
     pub scopes: Vec<String>,
+    /// Extra query parameters to add to the authorization URL.
+    /// e.g. `{ access_type = "offline", prompt = "consent" }` for Google.
+    #[serde(default)]
+    pub extra_auth_params: HashMap<String, String>,
 }
 
 impl OAuthProviderConfig {
@@ -97,6 +101,14 @@ pub struct MemoryConfig {
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
     pub system_prompt: String,
+    /// Maximum number of times a tool call can fail before the agent gives up
+    /// for that conversation turn. Defaults to 3.
+    #[serde(default = "default_max_tool_retries")]
+    pub max_tool_retries: usize,
+}
+
+fn default_max_tool_retries() -> usize {
+    3
 }
 
 #[derive(Debug, Deserialize)]

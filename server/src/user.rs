@@ -66,6 +66,22 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .await
     .context("failed to create user_providers table")?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS user_tokens (
+            user_id TEXT NOT NULL REFERENCES users(id),
+            provider TEXT NOT NULL,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            expires_at TEXT,
+            scopes TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, provider)
+        )",
+    )
+    .execute(pool)
+    .await
+    .context("failed to create user_tokens table")?;
+
     Ok(())
 }
 

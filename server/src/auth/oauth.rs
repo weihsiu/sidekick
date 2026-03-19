@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -20,6 +22,15 @@ pub struct UserInfo {
     pub locale: String,
 }
 
+/// Full result from an OAuth code exchange: user info + tokens.
+pub struct OAuthResult {
+    pub user_info: UserInfo,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<String>,
+    pub scopes: String,
+}
+
 /// Type alias for a BasicClient with auth_url and token_url set.
 type ConfiguredClient = BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
@@ -29,6 +40,7 @@ pub struct OAuthProvider {
     client: ConfiguredClient,
     scopes: Vec<String>,
     userinfo_url: String,
+    extra_auth_params: HashMap<String, String>,
 }
 
 impl OAuthProvider {
@@ -44,6 +56,7 @@ impl OAuthProvider {
             client,
             scopes: config.scopes.clone(),
             userinfo_url: config.userinfo_url.clone(),
+            extra_auth_params: config.extra_auth_params.clone(),
         })
     }
 
@@ -60,7 +73,13 @@ impl OAuthProvider {
             builder = builder.add_scope(Scope::new(scope.clone()));
         }
 
-        let (url, csrf_token) = builder.url();
+        let (mut url, csrf_token) = builder.url();
+
+        // Append extra query parameters (e.g. access_type=offline for Google).
+        for (key, value) in &self.extra_auth_params {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+
         (url.to_string(), csrf_token, pkce_verifier)
     }
 
@@ -69,7 +88,7 @@ impl OAuthProvider {
         &self,
         code: &str,
         pkce_verifier: Option<PkceCodeVerifier>,
-    ) -> Result<UserInfo> {
+    ) -> Result<OAuthResult> {
         let mut exchange = self
             .client
             .exchange_code(AuthorizationCode::new(code.to_string()));
@@ -84,8 +103,30 @@ impl OAuthProvider {
             .await
             .context("failed to exchange OAuth code for token")?;
 
-        let access_token = token_response.access_token().secret();
-        self.fetch_userinfo(access_token).await
+        let access_token = token_response.access_token().secret().to_string();
+        let refresh_token = token_response.refresh_token().map(|t| t.secret().to_string());
+        let expires_at = token_response.expires_in().map(|d| {
+            (chrono::Utc::now() + chrono::Duration::seconds(d.as_secs() as i64)).to_rfc3339()
+        });
+        let scopes = token_response
+            .scopes()
+            .map(|s| {
+                s.iter()
+                    .map(|scope| scope.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+
+        let user_info = self.fetch_userinfo(&access_token).await?;
+
+        Ok(OAuthResult {
+            user_info,
+            access_token,
+            refresh_token,
+            expires_at,
+            scopes,
+        })
     }
 
     /// Fetch user info from the provider's userinfo endpoint.
