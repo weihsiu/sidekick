@@ -217,12 +217,9 @@ async fn chat_handler(
 
     // Build message list: system prompt + recent chat window + current message.
     // Long-term memory is accessed via the recall_memory tool, not pre-injected.
-    tracing::info!(local_time = ?req.local_time, "building system prompt");
-    let system_prompt = match &req.local_time {
-        Some(t) => format!("{}\n\nUser's current date and time: {}", state.system_prompt, t),
-        None => format!("{}\n\nCurrent date and time (UTC): {}", state.system_prompt, chrono::Utc::now().format("%A, %B %-d, %Y %H:%M UTC")),
-    };
-    let mut messages = vec![Message::system(&system_prompt)];
+    // The static system prompt is kept unchanged so it can be cached by the LLM provider.
+    // The dynamic timestamp is injected just before the user message to avoid busting the cache.
+    let mut messages = vec![Message::system(&state.system_prompt)];
     let history = user_mem
         .semantic
         .chat_memory
@@ -230,6 +227,11 @@ async fn chat_handler(
         .await
         .context("failed to load chat history")?;
     messages.extend(history);
+    let time_str = match &req.local_time {
+        Some(t) => format!("Current date and time: {}", t),
+        None => format!("Current date and time (UTC): {}", chrono::Utc::now().format("%A, %B %-d, %Y %H:%M UTC")),
+    };
+    messages.push(Message::system(&time_str));
     messages.push(Message::human(&req.message));
 
     let msg_state = MessageState { messages };

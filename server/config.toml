@@ -37,7 +37,7 @@ scopes = ["email", "public_profile"]
 [llm]
 # Provider: "openai", "anthropic", "gemini", or "ollama"
 provider = "openai"
-model = "gpt-4o"
+model = "gpt-5.4-mini"
 api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
 
@@ -76,7 +76,7 @@ faq = 1.2
 
 [agent]
 # Maximum number of tool call failures before the agent stops retrying.
-max_tool_retries = 3
+max_tool_retries = 5
 # System prompt that defines the agent's persona and behavior.
 # Long-term memory is available via the recall_memory tool (not pre-injected).
 system_prompt = """
