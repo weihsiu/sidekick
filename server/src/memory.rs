@@ -394,17 +394,17 @@ impl SemanticMemory {
 ///
 /// Both databases are opened and evicted together so a single LRU slot
 /// controls the file-handle footprint for each user.
-pub struct UserMemory {
+pub struct UserStore {
     pub semantic: SemanticMemory,
     pub history: MemoryHistory,
 }
 
-/// LRU pool of per-user `UserMemory` instances.
+/// LRU pool of per-user `UserStore` instances.
 ///
 /// Opening databases holds file descriptors, so we cap the number of
 /// concurrently-open users and evict the least-recently-used ones.
-pub struct MemoryPool {
-    cache: Mutex<LruCache<String, Arc<UserMemory>>>,
+pub struct UserStorePool {
+    cache: Mutex<LruCache<String, Arc<UserStore>>>,
     base_path: String,
     table_name: String,
     top_k: usize,
@@ -416,7 +416,7 @@ pub struct MemoryPool {
     reranker: Arc<dyn Reranker>,
 }
 
-impl MemoryPool {
+impl UserStorePool {
     pub fn new(
         config: &MemoryConfig,
         embeddings: Arc<dyn Embeddings>,
@@ -445,8 +445,8 @@ impl MemoryPool {
         })
     }
 
-    /// Get or create a `UserMemory` for the given user.
-    pub async fn get(&self, user_id: &str) -> Result<Arc<UserMemory>> {
+    /// Get or create a `UserStore` for the given user.
+    pub async fn get(&self, user_id: &str) -> Result<Arc<UserStore>> {
         // Fast path: check the cache.
         {
             let mut cache = self.cache.lock().await;
@@ -457,7 +457,7 @@ impl MemoryPool {
 
         // Slow path: open/create both databases outside the cache lock.
         let lance_path = format!("{}/{}.lancedb", self.base_path, user_id);
-        let sqlite_path = format!("{}/{}.memory.db", self.base_path, user_id);
+        let sqlite_path = format!("{}/{}.db", self.base_path, user_id);
 
         let semantic = SemanticMemory::new(
             &lance_path,
@@ -477,7 +477,7 @@ impl MemoryPool {
             .await
             .with_context(|| format!("failed to open memory history for user '{user_id}'"))?;
 
-        let user_mem = Arc::new(UserMemory { semantic, history });
+        let user_mem = Arc::new(UserStore { semantic, history });
 
         let mut cache = self.cache.lock().await;
         if let Some(existing) = cache.get(user_id) {

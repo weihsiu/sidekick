@@ -121,11 +121,12 @@ Both are managed under a single LRU pool so they are opened and evicted together
 
 Categories not listed default to `1.0`.
 
-### `[agent]` — System prompt
+### `[agent]` — System prompt and tools
 
 | Field | Description |
 |-------|-------------|
 | `system_prompt` | Base system prompt defining the agent's persona and behavior. RAG context is appended automatically. |
+| `max_tool_retries` | *(optional, default `3`)* Max tool call failures before the agent stops retrying for that conversation turn. |
 
 ### Example configurations
 
@@ -410,6 +411,7 @@ Each line in the JSONL file is a JSON object with the following fields:
 | `category` | yes | | Entry category (e.g. `"knowledge"`, `"note"`, `"faq"`) |
 | `content` | yes | | The text content |
 | `role` | no | `"system"` | Role label (`"system"`, `"human"`, `"ai"`) |
+| `importance` | no | `5.0` | Importance weight 1–10 (higher = retrieved more often) |
 
 The `timestamp` is set to the time of import for all entries in the batch.
 
@@ -480,7 +482,7 @@ The `server/flyio/fly.toml` configures:
 
 ## Architecture
 
-- **OAuth2 authentication**: Login via Google or Facebook using PKCE flow. User identity stored in SQLite. Sessions managed by tower-sessions (in-memory) with an encrypted "remember me" cookie that survives server restarts and browser closes (30-day expiry). Modular provider config — add new providers by adding a `[auth.providers.<name>]` section.
+- **OAuth2 authentication**: Login via Google or Facebook using PKCE flow. User identity stored in SQLite. PKCE verifiers are persisted to SQLite (with a 10-minute TTL) so OAuth flows survive server restarts and work correctly across multiple instances. Sessions managed by tower-sessions (in-memory) with an encrypted "remember me" cookie that survives restarts and browser closes (30-day expiry). Modular provider config — add new providers by adding a `[auth.providers.<name>]` section.
 - **OAuth token storage**: Access and refresh tokens are persisted per user+provider in the auth SQLite database. Tokens are refreshed automatically (with a 5-minute expiry buffer) so tools can call Google APIs on the user's behalf.
 - **Multi-user**: Each user gets isolated databases at `data/users/{user_id}.lancedb` (semantic) and `data/users/{user_id}.memory.db` (history)
 - **Dual-store memory**: LanceDB for semantic/vector search (RAG retrieval) + SQLite for ordered, cursor-based browsing (infinite scroll). All writes go to both stores.
@@ -542,6 +544,7 @@ The agent has access to the following tools:
 | Tool | Description |
 |------|-------------|
 | `recall_memory` | Semantic search over the user's long-term memory |
+| `web_search` | Search the web via DuckDuckGo — no API key required |
 | `gmail` | Search and read messages, send email, modify labels |
 | `google_calendar` | List, create, update, and delete calendar events; check availability |
 | `google_tasks` | Manage task lists and individual tasks |
@@ -549,7 +552,7 @@ The agent has access to the following tools:
 
 Google tools require the user to have granted the relevant OAuth scopes (configured per provider in `config.toml`). Tokens are fetched and refreshed automatically — tools never prompt for re-authentication mid-conversation.
 
-All tools are wrapped with a retry layer that retries on transient failures (default: 3 attempts).
+All tools are wrapped with a retry layer that retries on transient failures. The limit is set via `agent.max_tool_retries` in `config.toml` (default: `3`).
 
 ## Project structure
 
@@ -581,6 +584,7 @@ server/
       google_tasks.rs     # Google Tasks tool
       google_people.rs    # Google Contacts tool
       recall_memory.rs    # Semantic memory recall tool
+      web_search.rs       # Web search via DuckDuckGo (no API key required)
       retry_wrapper.rs    # Retry wrapper for transient failures
 client/
   package.json            # React + Vite PWA frontend

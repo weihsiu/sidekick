@@ -5,15 +5,15 @@ use serde_json::Value;
 use synaptic::core::{SynapticError, Tool};
 
 use crate::context::CURRENT_USER_ID;
-use crate::memory::{format_context, MemoryPool};
+use crate::memory::{format_context, UserStorePool};
 
 /// Tool that lets the LLM search the user's long-term memory on demand.
 pub struct RecallMemory {
-    pool: Arc<MemoryPool>,
+    pool: Arc<UserStorePool>,
 }
 
 impl RecallMemory {
-    pub fn new(pool: Arc<MemoryPool>) -> Arc<dyn Tool> {
+    pub fn new(pool: Arc<UserStorePool>) -> Arc<dyn Tool> {
         Arc::new(Self { pool })
     }
 }

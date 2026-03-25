@@ -1,10 +1,9 @@
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 
-/// Save or update OAuth tokens for a user+provider pair.
+/// Save or update OAuth tokens for a provider in the per-user database.
 pub async fn save_tokens(
     pool: &SqlitePool,
-    user_id: &str,
     provider: &str,
     access_token: &str,
     refresh_token: Option<&str>,
@@ -13,16 +12,15 @@ pub async fn save_tokens(
 ) -> Result<()> {
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
-        "INSERT INTO user_tokens (user_id, provider, access_token, refresh_token, expires_at, scopes, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT (user_id, provider) DO UPDATE SET
-             access_token = excluded.access_token,
-             refresh_token = COALESCE(excluded.refresh_token, user_tokens.refresh_token),
-             expires_at = excluded.expires_at,
-             scopes = excluded.scopes,
-             updated_at = excluded.updated_at",
+        "INSERT INTO tokens (provider, access_token, refresh_token, expires_at, scopes, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (provider) DO UPDATE SET
+             access_token  = excluded.access_token,
+             refresh_token = COALESCE(excluded.refresh_token, tokens.refresh_token),
+             expires_at    = excluded.expires_at,
+             scopes        = excluded.scopes,
+             updated_at    = excluded.updated_at",
     )
-    .bind(user_id)
     .bind(provider)
     .bind(access_token)
     .bind(refresh_token)
@@ -31,12 +29,12 @@ pub async fn save_tokens(
     .bind(&now)
     .execute(pool)
     .await
-    .context("failed to upsert user tokens")?;
+    .context("failed to upsert tokens")?;
 
     Ok(())
 }
 
-/// Stored token row from the database.
+/// Stored token row from the per-user database.
 #[derive(sqlx::FromRow)]
 struct TokenRow {
     access_token: String,
@@ -44,26 +42,23 @@ struct TokenRow {
     expires_at: Option<String>,
 }
 
-/// Get a valid access token for a user+provider, refreshing if expired.
+/// Get a valid access token for a provider, refreshing if expired.
 ///
-/// Returns `None` if the user has no tokens stored for this provider.
+/// Returns `None` if no tokens are stored for this provider.
 pub async fn get_valid_token(
     pool: &SqlitePool,
-    user_id: &str,
     provider: &str,
     client_id: &str,
     client_secret: &str,
     token_url: &str,
 ) -> Result<Option<String>> {
     let row: Option<TokenRow> = sqlx::query_as(
-        "SELECT access_token, refresh_token, expires_at FROM user_tokens
-         WHERE user_id = ? AND provider = ?",
+        "SELECT access_token, refresh_token, expires_at FROM tokens WHERE provider = ?",
     )
-    .bind(user_id)
     .bind(provider)
     .fetch_optional(pool)
     .await
-    .context("failed to query user tokens")?;
+    .context("failed to query tokens")?;
 
     let row = match row {
         Some(r) => r,
@@ -84,15 +79,13 @@ pub async fn get_valid_token(
     let refresh_token = match row.refresh_token {
         Some(ref rt) if !rt.is_empty() => rt.clone(),
         _ => {
-            // No refresh token, return the (possibly expired) access token and hope for the best.
-            tracing::warn!(user_id, provider, "no refresh token available, using existing access token");
+            tracing::warn!(provider, "no refresh token available, using existing access token");
             return Ok(Some(row.access_token));
         }
     };
 
     let new_token = refresh_access_token(
         pool,
-        user_id,
         provider,
         client_id,
         client_secret,
@@ -107,7 +100,6 @@ pub async fn get_valid_token(
 /// Use a refresh token to obtain a new access token from the OAuth provider.
 async fn refresh_access_token(
     pool: &SqlitePool,
-    user_id: &str,
     provider: &str,
     client_id: &str,
     client_secret: &str,
@@ -144,22 +136,19 @@ async fn refresh_access_token(
         (chrono::Utc::now() + chrono::Duration::seconds(secs as i64)).to_rfc3339()
     });
 
-    // Update stored tokens.
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE user_tokens SET access_token = ?, expires_at = ?, updated_at = ?
-         WHERE user_id = ? AND provider = ?",
+        "UPDATE tokens SET access_token = ?, expires_at = ?, updated_at = ? WHERE provider = ?",
     )
     .bind(&access_token)
     .bind(&expires_at)
     .bind(&now)
-    .bind(user_id)
     .bind(provider)
     .execute(pool)
     .await
     .context("failed to update refreshed token")?;
 
-    tracing::info!(user_id, provider, "refreshed OAuth access token");
+    tracing::info!(provider, "refreshed OAuth access token");
 
     Ok(access_token)
 }

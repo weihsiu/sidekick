@@ -3,25 +3,26 @@ use axum_login::AuthUser;
 use serde::Serialize;
 use sqlx::SqlitePool;
 
-/// A user stored in the SQLite database.
+/// A user stored in the SQLite database (minimal — just enough for login routing).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct User {
     /// Internal user ID (UUID).
     pub id: String,
-    /// Display name.
-    pub name: String,
     /// Email address (used as the merge key across providers).
     pub email: String,
-    /// First name.
-    pub first_name: String,
-    /// Last name.
-    pub last_name: String,
-    /// Profile picture URL.
-    pub picture: String,
-    /// Locale (e.g. "en", "zh-TW").
-    pub locale: String,
     /// When the user was created.
     pub created_at: String,
+}
+
+/// Full user profile stored in the per-user database.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserProfile {
+    pub name: String,
+    pub email: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub picture: String,
+    pub locale: String,
 }
 
 impl AuthUser for User {
@@ -36,17 +37,13 @@ impl AuthUser for User {
     }
 }
 
-/// Initialise the users and user_providers tables.
+/// Initialise the shared authentication tables in sidekick.db.
 pub async fn init_db(pool: &SqlitePool) -> Result<()> {
+    // Minimal user table — just identity and merge key.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            first_name TEXT NOT NULL DEFAULT '',
-            last_name TEXT NOT NULL DEFAULT '',
-            picture TEXT NOT NULL DEFAULT '',
-            locale TEXT NOT NULL DEFAULT '',
+            id         TEXT PRIMARY KEY,
+            email      TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL
         )",
     )
@@ -54,10 +51,11 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .await
     .context("failed to create users table")?;
 
+    // Maps OAuth provider identities to internal user IDs.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS user_providers (
-            user_id TEXT NOT NULL REFERENCES users(id),
-            provider TEXT NOT NULL,
+            user_id          TEXT NOT NULL REFERENCES users(id),
+            provider         TEXT NOT NULL,
             provider_user_id TEXT NOT NULL,
             PRIMARY KEY (provider, provider_user_id)
         )",
@@ -66,21 +64,31 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .await
     .context("failed to create user_providers table")?;
 
+    // Short-lived PKCE verifiers for in-flight OAuth flows.
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS user_tokens (
-            user_id TEXT NOT NULL REFERENCES users(id),
-            provider TEXT NOT NULL,
-            access_token TEXT NOT NULL,
-            refresh_token TEXT,
-            expires_at TEXT,
-            scopes TEXT NOT NULL DEFAULT '',
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (user_id, provider)
+        "CREATE TABLE IF NOT EXISTS oauth_state (
+            csrf_token    TEXT PRIMARY KEY,
+            pkce_verifier TEXT NOT NULL,
+            created_at    INTEGER NOT NULL
         )",
     )
     .execute(pool)
     .await
-    .context("failed to create user_tokens table")?;
+    .context("failed to create oauth_state table")?;
+
+    // Public directory for discoverability (future agent-to-agent chat).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS directory (
+            user_id      TEXT PRIMARY KEY REFERENCES users(id),
+            display_name TEXT NOT NULL,
+            handle       TEXT UNIQUE,
+            picture      TEXT NOT NULL DEFAULT '',
+            visible      INTEGER NOT NULL DEFAULT 1
+        )",
+    )
+    .execute(pool)
+    .await
+    .context("failed to create directory table")?;
 
     Ok(())
 }
@@ -90,16 +98,14 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
 /// Users are matched by email: if a user with the same email already exists
 /// (e.g. from a different OAuth provider), the existing user is returned and
 /// the new provider is linked.
+///
+/// Profile fields (name, picture, etc.) are stored in the per-user database,
+/// not here — call `MemoryHistory::upsert_profile` after this.
 pub async fn find_or_create(
     pool: &SqlitePool,
     provider: &str,
     provider_user_id: &str,
-    name: &str,
     email: &str,
-    first_name: &str,
-    last_name: &str,
-    picture: &str,
-    locale: &str,
 ) -> Result<User> {
     // First check if this exact provider link already exists.
     let existing: Option<User> = sqlx::query_as(
@@ -114,58 +120,29 @@ pub async fn find_or_create(
     .context("failed to query user by provider")?;
 
     if let Some(user) = existing {
-        // Update profile fields from latest OAuth info.
-        sqlx::query(
-            "UPDATE users SET name = ?, first_name = ?, last_name = ?, picture = ?, locale = ?
-             WHERE id = ?",
-        )
-        .bind(name)
-        .bind(first_name)
-        .bind(last_name)
-        .bind(picture)
-        .bind(locale)
-        .bind(&user.id)
-        .execute(pool)
-        .await
-        .context("failed to update user profile")?;
-
-        return find_by_id(pool, &user.id)
-            .await?
-            .context("user disappeared after update");
+        return Ok(user);
     }
 
     // Check if a user with the same email exists (merge across providers).
-    let by_email: Option<User> = sqlx::query_as(
-        "SELECT * FROM users WHERE email = ?",
-    )
-    .bind(email)
-    .fetch_optional(pool)
-    .await
-    .context("failed to query user by email")?;
+    let by_email: Option<User> = sqlx::query_as("SELECT * FROM users WHERE email = ?")
+        .bind(email)
+        .fetch_optional(pool)
+        .await
+        .context("failed to query user by email")?;
 
     let user_id = if let Some(existing_user) = by_email {
-        // Link the new provider to the existing user.
         existing_user.id
     } else {
-        // Create a new user.
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
 
-        sqlx::query(
-            "INSERT INTO users (id, name, email, first_name, last_name, picture, locale, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(name)
-        .bind(email)
-        .bind(first_name)
-        .bind(last_name)
-        .bind(picture)
-        .bind(locale)
-        .bind(&created_at)
-        .execute(pool)
-        .await
-        .context("failed to insert user")?;
+        sqlx::query("INSERT INTO users (id, email, created_at) VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(email)
+            .bind(&created_at)
+            .execute(pool)
+            .await
+            .context("failed to insert user")?;
 
         id
     };

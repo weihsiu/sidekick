@@ -37,7 +37,7 @@ use axum_extra::extract::cookie::PrivateCookieJar;
 use auth::AuthBackend;
 use auth::routes::require_user;
 use error::ApiError;
-use memory::MemoryPool;
+use memory::UserStorePool;
 
 type Jar = PrivateCookieJar<CookieKey>;
 use dotenvy::dotenv;
@@ -96,7 +96,7 @@ impl From<CookieKey> for Key {
 }
 
 struct AppState {
-    pool: Arc<MemoryPool>,
+    pool: Arc<UserStorePool>,
     graph: CompiledGraph<MessageState>,
     system_prompt: String,
     cookie_key: CookieKey,
@@ -333,14 +333,19 @@ async fn history_handler(
 
     // First-time user: store their name as knowledge and add a welcome message.
     if user_mem.history.is_empty().await? {
-        let name_fact = format!("The user's name is {}.", user.name);
+        let profile = user_mem.history.get_profile().await?;
+        let (display_name, first_name) = profile
+            .map(|p| (p.name, p.first_name))
+            .unwrap_or_else(|| (user.email.clone(), user.email.clone()));
+
+        let name_fact = format!("The user's name is {}.", display_name);
         let now = chrono::Utc::now().to_rfc3339();
         user_mem.semantic.store("knowledge", "system", &name_fact, 10.0).await?;
         user_mem.history.append("knowledge", "system", &name_fact, &now, 10.0).await?;
 
         let welcome = format!(
             "Welcome to Sidekick, {}! I'm your AI assistant with long-term memory. How can I help you today?",
-            user.first_name
+            first_name
         );
         user_mem.history.append("conversation", "ai", &welcome, &now, 1.0).await?;
         user_mem.semantic.chat_memory
@@ -461,7 +466,7 @@ async fn main() -> anyhow::Result<()> {
 
     let model = provider::build_model(&cfg.llm)?;
 
-    let pool = Arc::new(memory::MemoryPool::new(
+    let pool = Arc::new(memory::UserStorePool::new(
         &cfg.memory,
         emb,
         reranker,
@@ -478,9 +483,10 @@ async fn main() -> anyhow::Result<()> {
     let max_tool_retries = cfg.agent.max_tool_retries;
     let mut all_tools: Vec<Arc<dyn synaptic::core::Tool>> = vec![
         tools::recall_memory::RecallMemory::new(pool.clone()),
+        Arc::new(tools::web_search::WebSearch::new()),
     ];
     if let Some(google_config) = cfg.auth.providers.get("google") {
-        let api = tools::google_api::GoogleApiClient::new(db.clone(), google_config)?;
+        let api = tools::google_api::GoogleApiClient::new(pool.clone(), google_config)?;
         let mut t = tools::google_calendar::create_tools(api.clone());
         t.extend(tools::gmail::create_tools(api.clone()));
         t.extend(tools::google_tasks::create_tools(api.clone()));

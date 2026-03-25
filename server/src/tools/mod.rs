@@ -5,3 +5,4 @@ pub mod google_people;
 pub mod google_tasks;
 pub mod recall_memory;
 pub mod retry_wrapper;
+pub mod web_search;

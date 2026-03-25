@@ -3,15 +3,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use reqwest::{Client, Method};
 use serde_json::Value;
-use sqlx::SqlitePool;
 
 use crate::config::OAuthProviderConfig;
 use crate::context::CURRENT_USER_ID;
+use crate::memory::UserStorePool;
 
-/// Shared Google API client that resolves per-user tokens from the database.
+/// Shared Google API client that resolves per-user tokens from the per-user database.
 #[derive(Clone)]
 pub struct GoogleApiClient {
-    pub(crate) db: SqlitePool,
+    pub(crate) memory_pool: Arc<UserStorePool>,
     pub(crate) http: Client,
     pub(crate) client_id: String,
     pub(crate) client_secret: String,
@@ -19,9 +19,9 @@ pub struct GoogleApiClient {
 }
 
 impl GoogleApiClient {
-    pub fn new(db: SqlitePool, google_config: &OAuthProviderConfig) -> Result<Arc<Self>> {
+    pub fn new(memory_pool: Arc<UserStorePool>, google_config: &OAuthProviderConfig) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            db,
+            memory_pool,
             http: Client::new(),
             client_id: google_config.client_id.clone(),
             client_secret: google_config.client_secret()?,
@@ -40,9 +40,13 @@ impl GoogleApiClient {
 
         tracing::debug!(user_id = %user_id, "looking up Google token for user");
 
+        let user_mem = self.memory_pool.get(&user_id).await.map_err(|e| {
+            tracing::error!(user_id = %user_id, error = %e, "failed to open per-user db");
+            synaptic::core::SynapticError::Tool(format!("db error: {e}"))
+        })?;
+
         let token = crate::auth::tokens::get_valid_token(
-            &self.db,
-            &user_id,
+            user_mem.history.pool(),
             "google",
             &self.client_id,
             &self.client_secret,
@@ -57,7 +61,7 @@ impl GoogleApiClient {
         match token {
             Some(t) => Ok(t),
             None => {
-                tracing::warn!(user_id = %user_id, "no Google token row found in user_tokens");
+                tracing::warn!(user_id = %user_id, "no Google token found in per-user db");
                 Err(synaptic::core::SynapticError::Tool(
                     "no Google token found — user needs to re-authenticate with Google".into(),
                 ))

@@ -1,4 +1,4 @@
-use axum::extract::{Path, Query};
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect};
 use axum::Json;
 use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
@@ -7,9 +7,11 @@ use crate::CookieKey;
 type Jar = PrivateCookieJar<CookieKey>;
 use axum_login::AuthSession;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::error::ApiError;
 use crate::user::{self, User};
+use crate::AppState;
 
 use super::AuthBackend;
 
@@ -64,11 +66,9 @@ pub async fn login(
 
     let (auth_url, csrf_token, pkce_verifier) = provider.authorize_url();
 
-    // Store the PKCE verifier keyed by CSRF token so the callback can retrieve it.
-    {
-        let mut map = backend.csrf_verifiers.lock().await;
-        map.insert(csrf_token.secret().clone(), pkce_verifier);
-    }
+    // Persist the PKCE verifier to SQLite so it survives restarts and multi-instance deployments.
+    backend.store_pkce(csrf_token.secret(), &pkce_verifier).await
+        .map_err(|e| anyhow::anyhow!("failed to store PKCE verifier: {e}"))?;
 
     Ok(Redirect::temporary(&auth_url))
 }
@@ -79,12 +79,11 @@ pub async fn callback(
     Query(params): Query<CallbackParams>,
     mut auth_session: AuthSession<AuthBackend>,
     jar: Jar,
+    State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // Retrieve and consume the PKCE verifier.
-    let pkce_verifier = {
-        let mut map = auth_session.backend.csrf_verifiers.lock().await;
-        map.remove(&params.state)
-    };
+    // Retrieve and consume the PKCE verifier from SQLite.
+    let pkce_verifier = auth_session.backend.take_pkce(&params.state).await
+        .map_err(|e| anyhow::anyhow!("failed to retrieve PKCE verifier: {e}"))?;
 
     let provider = auth_session
         .backend
@@ -95,24 +94,29 @@ pub async fn callback(
         .exchange_code(&params.code, pkce_verifier)
         .await?;
 
-    // Find or create the user.
+    // Find or create the user in sidekick.db (identity only).
     let user = crate::user::find_or_create(
         &auth_session.backend.db,
         &provider_name,
         &oauth_result.user_info.id,
+        &oauth_result.user_info.email,
+    )
+    .await?;
+
+    // Open the per-user database and write profile + tokens.
+    let user_mem = state.pool.get(&user.id).await?;
+
+    user_mem.history.upsert_profile(
         &oauth_result.user_info.name,
         &oauth_result.user_info.email,
         &oauth_result.user_info.first_name,
         &oauth_result.user_info.last_name,
         &oauth_result.user_info.picture,
         &oauth_result.user_info.locale,
-    )
-    .await?;
+    ).await?;
 
-    // Persist OAuth tokens for API access (calendar, etc.).
     super::tokens::save_tokens(
-        &auth_session.backend.db,
-        &user.id,
+        user_mem.history.pool(),
         &provider_name,
         &oauth_result.access_token,
         oauth_result.refresh_token.as_deref(),
@@ -120,6 +124,21 @@ pub async fn callback(
         &oauth_result.scopes,
     )
     .await?;
+
+    // Update public directory in sidekick.db.
+    sqlx::query(
+        "INSERT INTO directory (user_id, display_name, picture)
+         VALUES (?, ?, ?)
+         ON CONFLICT (user_id) DO UPDATE SET
+             display_name = excluded.display_name,
+             picture      = excluded.picture",
+    )
+    .bind(&user.id)
+    .bind(&oauth_result.user_info.name)
+    .bind(&oauth_result.user_info.picture)
+    .execute(&auth_session.backend.db)
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to upsert directory: {e}"))?;
 
     // Log the user in (creates a session).
     let user_id = user.id.clone();
@@ -163,6 +182,7 @@ pub async fn logout(
 pub async fn me(
     mut auth_session: AuthSession<AuthBackend>,
     jar: Jar,
+    State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
 
@@ -174,14 +194,22 @@ pub async fn me(
     .await
     .unwrap_or_default();
 
+    let user_mem = state.pool.get(&user.id).await?;
+    let profile = user_mem.history.get_profile().await?;
+
+    let (name, email, first_name, last_name, picture, locale) = match profile {
+        Some(p) => (p.name, p.email, p.first_name, p.last_name, p.picture, p.locale),
+        None => (String::new(), user.email, String::new(), String::new(), String::new(), String::new()),
+    };
+
     Ok(Json(MeResponse {
         id: user.id,
-        name: user.name,
-        email: user.email,
-        first_name: user.first_name,
-        last_name: user.last_name,
-        picture: user.picture,
-        locale: user.locale,
+        name,
+        email,
+        first_name,
+        last_name,
+        picture,
+        locale,
         providers,
     }))
 }

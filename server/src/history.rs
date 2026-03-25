@@ -3,6 +3,8 @@ use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 
+use crate::user::UserProfile;
+
 /// A single memory entry stored in the history database.
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntry {
@@ -34,6 +36,46 @@ impl MemoryHistory {
             .connect(&format!("sqlite:{db_path}?mode=rwc"))
             .await
             .with_context(|| format!("failed to open memory history db at {db_path}"))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS profile (
+                name       TEXT NOT NULL DEFAULT '',
+                email      TEXT NOT NULL DEFAULT '',
+                first_name TEXT NOT NULL DEFAULT '',
+                last_name  TEXT NOT NULL DEFAULT '',
+                picture    TEXT NOT NULL DEFAULT '',
+                locale     TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&db)
+        .await
+        .context("failed to create profile table")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS tokens (
+                provider      TEXT PRIMARY KEY,
+                access_token  TEXT NOT NULL,
+                refresh_token TEXT,
+                expires_at    TEXT,
+                scopes        TEXT NOT NULL DEFAULT '',
+                updated_at    TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .context("failed to create tokens table")?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS contacts (
+                user_id  TEXT PRIMARY KEY,
+                nickname TEXT,
+                blocked  INTEGER NOT NULL DEFAULT 0,
+                added_at TEXT NOT NULL
+            )",
+        )
+        .execute(&db)
+        .await
+        .context("failed to create contacts table")?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS memory (
@@ -158,6 +200,63 @@ impl MemoryHistory {
         entries.reverse();
 
         Ok(entries)
+    }
+
+    /// Expose the underlying pool for token operations.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.db
+    }
+
+    /// Insert or replace the user's profile (single-row table).
+    pub async fn upsert_profile(
+        &self,
+        name: &str,
+        email: &str,
+        first_name: &str,
+        last_name: &str,
+        picture: &str,
+        locale: &str,
+    ) -> Result<()> {
+        // Ensure only one row exists by deleting first.
+        sqlx::query("DELETE FROM profile")
+            .execute(&self.db)
+            .await
+            .context("failed to clear profile")?;
+
+        sqlx::query(
+            "INSERT INTO profile (name, email, first_name, last_name, picture, locale)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(email)
+        .bind(first_name)
+        .bind(last_name)
+        .bind(picture)
+        .bind(locale)
+        .execute(&self.db)
+        .await
+        .context("failed to upsert profile")?;
+
+        Ok(())
+    }
+
+    /// Fetch the user's profile, if it exists.
+    pub async fn get_profile(&self) -> Result<Option<UserProfile>> {
+        let row: Option<(String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT name, email, first_name, last_name, picture, locale FROM profile LIMIT 1",
+        )
+        .fetch_optional(&self.db)
+        .await
+        .context("failed to fetch profile")?;
+
+        Ok(row.map(|(name, email, first_name, last_name, picture, locale)| UserProfile {
+            name,
+            email,
+            first_name,
+            last_name,
+            picture,
+            locale,
+        }))
     }
 }
 
