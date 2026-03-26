@@ -1,4 +1,5 @@
 mod auth;
+mod chat_service;
 mod config;
 mod context;
 mod embeddings;
@@ -10,37 +11,42 @@ mod rerank;
 mod tools;
 mod user;
 
+use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::State;
+use axum::http::{header, StatusCode, Uri};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum_extra::extract::cookie::Key;
+use axum_extra::extract::cookie::PrivateCookieJar;
 use axum_login::{AuthManagerLayerBuilder, AuthSession};
+use dotenvy::dotenv;
+use futures::StreamExt;
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
-use synaptic::core::{MemoryStore, Message};
-use synaptic::graph::{create_react_agent, CompiledGraph, MessageState};
-use axum::http::{header, StatusCode, Uri};
-use rust_embed::RustEmbed;
+use synaptic::core::MemoryStore;
+use synaptic::core::Message;
+use synaptic::graph::create_react_agent;
+use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use axum_extra::extract::cookie::Key;
 use tower_sessions::cookie::SameSite;
 use tower_sessions::{MemoryStore as SessionMemoryStore, SessionManagerLayer};
 
-use axum_extra::extract::cookie::PrivateCookieJar;
-
 use auth::AuthBackend;
 use auth::routes::require_user;
+use chat_service::ChatService;
 use error::ApiError;
-use memory::UserStorePool;
 
 type Jar = PrivateCookieJar<CookieKey>;
-use dotenvy::dotenv;
 
 #[derive(RustEmbed)]
 #[folder = "../client/dist/"]
@@ -53,8 +59,6 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            // index.html and SW must never be cached — they reference hashed assets.
-            // Hashed assets (JS/CSS under assets/) are immutable and safe to cache forever.
             let cache_control = if path == "index.html" || path == "sw.js" {
                 "no-store"
             } else {
@@ -96,12 +100,8 @@ impl From<CookieKey> for Key {
 }
 
 struct AppState {
-    pool: Arc<UserStorePool>,
-    graph: CompiledGraph<MessageState>,
-    system_prompt: String,
+    chat_service: Arc<ChatService>,
     cookie_key: CookieKey,
-    /// Shared failure counter for tool retries — reset before each graph.invoke().
-    tool_failure_count: Arc<AtomicUsize>,
 }
 
 impl axum::extract::FromRef<Arc<AppState>> for CookieKey {
@@ -120,11 +120,6 @@ struct ChatRequest {
     local_time: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ChatResponse {
-    response: String,
-}
-
 #[derive(Deserialize)]
 struct StoreRequest {
     category: String,
@@ -132,6 +127,10 @@ struct StoreRequest {
     content: String,
     #[serde(default = "default_importance")]
     importance: f32,
+}
+
+fn default_importance() -> f32 {
+    5.0
 }
 
 #[derive(Deserialize)]
@@ -167,43 +166,32 @@ struct HistoryQuery {
 }
 
 // ---------------------------------------------------------------------------
-// Structured LLM response parsing
+// Handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct StructuredLlmResponse {
-    response: String,
-    #[serde(default = "default_importance")]
-    importance: f32,
+/// SSE endpoint — each authenticated client subscribes here to receive
+/// real-time events (human messages and AI responses) for their user account.
+async fn sse_handler(
+    mut auth_session: AuthSession<AuthBackend>,
+    jar: Jar,
+    State(state): State<Arc<AppState>>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let user = require_user(&mut auth_session, &jar).await?;
+    let rx = state.chat_service.subscribe(&user.id);
+
+    let stream = BroadcastStream::new(rx).filter_map(|result| async move {
+        let ev = result.ok()?;
+        let data = serde_json::to_string(&ev).ok()?;
+        Some(Ok::<Event, Infallible>(Event::default().data(data)))
+    });
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new().interval(Duration::from_secs(25)),
+    ))
 }
 
-fn default_importance() -> f32 {
-    5.0
-}
-
-/// Parse the LLM output as JSON `{"response": "...", "importance": N}`.
-/// Falls back to treating the entire string as the response with default importance.
-fn parse_structured_response(raw: &str) -> (String, f32) {
-    // Try parsing the raw output as JSON first.
-    if let Ok(parsed) = serde_json::from_str::<StructuredLlmResponse>(raw) {
-        return (parsed.response, parsed.importance.clamp(1.0, 10.0));
-    }
-    // If the LLM wrapped JSON in a markdown code block, try extracting it.
-    if let Some(start) = raw.find('{') {
-        if let Some(end) = raw.rfind('}') {
-            if let Ok(parsed) = serde_json::from_str::<StructuredLlmResponse>(&raw[start..=end]) {
-                return (parsed.response, parsed.importance.clamp(1.0, 10.0));
-            }
-        }
-    }
-    // Fallback: treat entire output as the response.
-    (raw.to_string(), 5.0)
-}
-
-// ---------------------------------------------------------------------------
-// Handlers (user_id comes from the authenticated session)
-// ---------------------------------------------------------------------------
-
+/// Submit a message. The human message and AI response are delivered to all
+/// connected clients (including the sender) via SSE.
 async fn chat_handler(
     mut auth_session: AuthSession<AuthBackend>,
     jar: Jar,
@@ -211,69 +199,11 @@ async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
-    let user_id = &user.id;
-
-    let user_mem = state.pool.get(user_id).await?;
-
-    // Build message list: system prompt + recent chat window + current message.
-    // Long-term memory is accessed via the recall_memory tool, not pre-injected.
-    // The static system prompt is kept unchanged so it can be cached by the LLM provider.
-    // The dynamic timestamp is injected just before the user message to avoid busting the cache.
-    let mut messages = vec![Message::system(&state.system_prompt)];
-    let history = user_mem
-        .semantic
-        .chat_memory
-        .load(user_id)
-        .await
-        .context("failed to load chat history")?;
-    messages.extend(history);
-    let time_str = match &req.local_time {
-        Some(t) => format!("Current date and time: {}", t),
-        None => format!("Current date and time (UTC): {}", chrono::Utc::now().format("%A, %B %-d, %Y %H:%M UTC")),
-    };
-    messages.push(Message::system(&time_str));
-    messages.push(Message::human(&req.message));
-
-    let msg_state = MessageState { messages };
-
-    // Reset the shared tool failure counter for this conversation turn.
-    state.tool_failure_count.store(0, Ordering::SeqCst);
-
-    let user_id_owned = user_id.to_string();
-    let result = context::CURRENT_USER_ID
-        .scope(user_id_owned, state.graph.invoke(msg_state))
-        .await
-        .context("LLM invocation failed")?;
-    let final_state: &MessageState = result.state();
-
-    let raw = final_state
-        .last_message()
-        .map(|m: &Message| m.content().to_string())
-        .unwrap_or_default();
-
-    // Parse structured response: {"response": "...", "importance": N}
-    // Fall back to treating the entire output as the response with default importance.
-    let (response, importance) = parse_structured_response(&raw);
-    tracing::debug!(importance = importance, "chat response importance");
-
-    // Persist to long-term memory (LanceDB) as a single combined entry,
-    // to history (SQLite) as two separate entries for display,
-    // and to the chat window for short-term context.
-    let now = chrono::Utc::now().to_rfc3339();
-    let combined = format!("User: {}\nAssistant: {}", req.message, response);
-    user_mem.semantic.store("conversation", "conversation", &combined, importance).await?;
-    user_mem.history.append("conversation", "human", &req.message, &now, importance).await?;
-    user_mem.history.append("conversation", "ai", &response, &now, importance).await?;
-    user_mem.semantic.chat_memory
-        .append(user_id, Message::human(&req.message))
-        .await
-        .context("failed to append to chat window")?;
-    user_mem.semantic.chat_memory
-        .append(user_id, Message::ai(&response))
-        .await
-        .context("failed to append to chat window")?;
-
-    Ok(Json(ChatResponse { response }))
+    state
+        .chat_service
+        .process_message(&user.id, &req.message, req.local_time.as_deref())
+        .await?;
+    Ok(StatusCode::OK)
 }
 
 async fn store_handler(
@@ -283,7 +213,7 @@ async fn store_handler(
     Json(req): Json<StoreRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
-    let user_mem = state.pool.get(&user.id).await?;
+    let user_mem = state.chat_service.pool().get(&user.id).await?;
     user_mem.semantic.store(&req.category, &req.role, &req.content, req.importance).await?;
     let now = chrono::Utc::now().to_rfc3339();
     user_mem.history.append(&req.category, &req.role, &req.content, &now, req.importance).await?;
@@ -300,7 +230,7 @@ async fn search_handler(
     Json(req): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
-    let user_mem = state.pool.get(&user.id).await?;
+    let user_mem = state.chat_service.pool().get(&user.id).await?;
 
     let cat_refs: Option<Vec<&str>> = req
         .categories
@@ -329,7 +259,7 @@ async fn history_handler(
     axum::extract::Query(params): axum::extract::Query<HistoryQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
-    let user_mem = state.pool.get(&user.id).await?;
+    let user_mem = state.chat_service.pool().get(&user.id).await?;
 
     // First-time user: store their name as knowledge and add a welcome message.
     if user_mem.history.is_empty().await? {
@@ -348,7 +278,9 @@ async fn history_handler(
             first_name
         );
         user_mem.history.append("conversation", "ai", &welcome, &now, 1.0).await?;
-        user_mem.semantic.chat_memory
+        user_mem
+            .semantic
+            .chat_memory
             .append(&user.id, Message::ai(&welcome))
             .await
             .context("failed to append welcome message")?;
@@ -476,9 +408,6 @@ async fn main() -> anyhow::Result<()> {
     )?);
 
     // --- Tools ---
-    // Wrap each tool with RetryAwareTool so tool errors are returned to the LLM
-    // as messages (allowing it to retry or inform the user) instead of aborting
-    // the graph. A shared failure counter limits total retries per conversation turn.
     let tool_failure_count = Arc::new(AtomicUsize::new(0));
     let max_tool_retries = cfg.agent.max_tool_retries;
     let mut all_tools: Vec<Arc<dyn synaptic::core::Tool>> = vec![
@@ -506,26 +435,27 @@ async fn main() -> anyhow::Result<()> {
 
     let graph = create_react_agent(model, all_tools).context("failed to create agent")?;
 
-    let state = Arc::new(AppState {
+    let chat_service = Arc::new(ChatService::new(
         pool,
         graph,
-        system_prompt: cfg.agent.system_prompt,
-        cookie_key: CookieKey(cookie_key),
+        cfg.agent.system_prompt,
         tool_failure_count,
+    ));
+
+    let state = Arc::new(AppState {
+        chat_service,
+        cookie_key: CookieKey(cookie_key),
     });
 
     // --- Routes ---
-    // Protected API routes (require login).
     let api_routes = Router::new()
+        .route("/v1/events", get(sse_handler))
         .route("/v1/chat", post(chat_handler))
         .route("/v1/memory/store", post(store_handler))
         .route("/v1/memory/search", post(search_handler))
         .route("/v1/history", get(history_handler))
         .with_state(state.clone());
 
-    // Auth routes (public).
-    // NOTE: exact routes must be registered before the wildcard {provider}
-    // so that /auth/me and /auth/logout don't get captured by {provider}.
     let auth_routes = Router::new()
         .route("/auth/me", get(auth::routes::me))
         .route("/auth/logout", post(auth::routes::logout))

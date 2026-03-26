@@ -4,8 +4,8 @@ An agentic AI assistant built in Rust with [Synaptic](https://github.com/dnw3/sy
 
 Sidekick has a Rust backend and a React frontend, packaged as a PWA:
 
-- **`server/`** — Axum HTTP server with OAuth2 authentication, per-user dual-store memory (LanceDB for semantic search + SQLite for browsable history), and short-term chat window. The client is embedded into the server binary via `rust-embed`, producing a single self-contained executable.
-- **`client/`** — React + Vite PWA with OAuth login, chat UI, and infinite scroll conversation history
+- **`server/`** — Axum HTTP server with OAuth2 authentication, per-user dual-store memory (LanceDB for semantic search + SQLite for browsable history), short-term chat window, and SSE push for real-time multi-client sync. The client is embedded into the server binary via `rust-embed`, producing a single self-contained executable.
+- **`client/`** — React + Vite PWA with OAuth login, chat UI, infinite scroll conversation history, and real-time sync across browser tabs and devices via SSE
 
 Each user gets their own LanceDB database for semantic search and a SQLite database for ordered history, both managed under a single LRU pool for file descriptor efficiency. Past entries are retrieved via hybrid search (dense vector + full-text keyword matching with Reciprocal Rank Fusion) and injected as context on every turn, giving the agent long-term memory per user.
 
@@ -306,21 +306,26 @@ All API endpoints require authentication (session cookie from OAuth login). Unau
 | `POST` | `/auth/logout` | Log out (destroy session + clear remember cookie) |
 | `GET` | `/auth/me` | Return current user info. Restores session from remember cookie if expired. Returns 401 if not logged in. |
 
+### `GET /v1/events`
+
+Subscribe to real-time events for the current user via Server-Sent Events. The connection stays open and delivers events as they occur. All connected clients for the same user (e.g. multiple tabs or devices) receive every event.
+
+Each event is a JSON object with a `type` field:
+
+```json
+{ "type": "human_message", "id": 41, "content": "What did we talk about yesterday?", "timestamp": "..." }
+{ "type": "ai_response",   "id": 42, "content": "Yesterday we discussed...",           "timestamp": "..." }
+```
+
+The client should open this connection before sending any messages. The stream includes a keepalive ping every 25 seconds to prevent proxy timeouts.
+
 ### `POST /v1/chat`
 
-Send a message and get a response. The user's message and the assistant's response are both stored in memory automatically (both LanceDB and SQLite).
+Submit a message. Returns `200 OK` with no body. The human message and AI response are delivered asynchronously to all connected clients via `GET /v1/events`.
 
 ```json
 {
   "message": "What did we talk about yesterday?"
-}
-```
-
-Response:
-
-```json
-{
-  "response": "Yesterday we discussed..."
 }
 ```
 
@@ -485,6 +490,8 @@ The `server/flyio/fly.toml` configures:
 - **OAuth2 authentication**: Login via Google or Facebook using PKCE flow. User identity stored in SQLite. PKCE verifiers are persisted to SQLite (with a 10-minute TTL) so OAuth flows survive server restarts and work correctly across multiple instances. Sessions managed by tower-sessions (in-memory) with an encrypted "remember me" cookie that survives restarts and browser closes (30-day expiry). Modular provider config — add new providers by adding a `[auth.providers.<name>]` section.
 - **OAuth token storage**: Access and refresh tokens are persisted per user+provider in the auth SQLite database. Tokens are refreshed automatically (with a 5-minute expiry buffer) so tools can call Google APIs on the user's behalf.
 - **Multi-user**: Each user gets isolated databases at `data/users/{user_id}.lancedb` (semantic) and `data/users/{user_id}.memory.db` (history)
+- **Real-time multi-client sync**: All browser tabs and devices logged in as the same user share a live SSE connection (`GET /v1/events`). When any client sends a message, the human message and AI response are broadcast to every connected client simultaneously via per-user `tokio::sync::broadcast` channels stored in a `DashMap`.
+- **Service layer**: `ChatService` encapsulates all message-processing logic (LLM invocation, persistence, broadcast) independently of HTTP. Axum handlers are thin wrappers that authenticate and delegate.
 - **Dual-store memory**: LanceDB for semantic/vector search (RAG retrieval) + SQLite for ordered, cursor-based browsing (infinite scroll). All writes go to both stores.
 - **Memory pool**: A single LRU cache manages both databases per user as one unit, evicting idle users to conserve file descriptors
 - **Thread-safe writes**: A per-database mutex serialises store operations and FTS index rebuilds while reads proceed concurrently
@@ -493,20 +500,22 @@ The `server/flyio/fly.toml` configures:
 - **Reranking**: Retrieved results are reranked with configurable category weight boosts
 - **Structured LLM responses**: The agent returns structured JSON with an `importance` score (1–10). High-importance responses are written to long-term memory; low-importance ones are skipped, reducing noise in the memory stores.
 - **Agent tools**: The agent can call tools to act on the user's behalf. Tools read the current user ID from a task-local context set per request, so tool calls in concurrent requests are always isolated to the correct user.
-- **PWA**: Installable progressive web app with service worker caching for offline static assets
+- **PWA**: Installable progressive web app with service worker caching for offline static assets. Links in chat messages open in the system browser.
 
 ## How it works
 
 1. User logs in via OAuth (Google/Facebook) — session cookie and encrypted "remember me" cookie are set
 2. Client loads recent conversation history from SQLite via `GET /v1/history` (infinite scroll)
-3. Client sends a `POST /v1/chat` with a `message`
-4. The user's databases are opened from the pool (or created on first use)
-5. The message is embedded and used to search the user's LanceDB via hybrid search (long-term semantic memory)
-6. The configurable system prompt + retrieved RAG context are injected as a system message
-7. The recent chat window (last N messages) is included as message history for conversational continuity
-8. The LLM generates a response with both long-term and short-term context
-9. Both the user message and the assistant response are stored in LanceDB (semantic) and SQLite (history), plus the chat window (short-term)
-10. The response is returned to the client
+3. Client opens a persistent SSE connection to `GET /v1/events`
+4. Client sends a `POST /v1/chat` with a `message`
+5. Server saves the human message to SQLite and immediately broadcasts a `human_message` event to all connected clients for that user
+6. The user's databases are opened from the pool (or created on first use)
+7. The message is embedded and used to search the user's LanceDB via hybrid search (long-term semantic memory)
+8. The configurable system prompt + retrieved RAG context are injected as a system message
+9. The recent chat window (last N messages) is included as message history for conversational continuity
+10. The LLM generates a response with both long-term and short-term context
+11. Both the user message and the assistant response are stored in LanceDB (semantic) and SQLite (history), plus the chat window (short-term)
+12. Server broadcasts an `ai_response` event — all connected clients display the response simultaneously
 
 ## Data stores
 
@@ -562,6 +571,7 @@ server/
   config.toml             # Runtime configuration
   src/
     main.rs               # HTTP server, API handlers, --import CLI
+    chat_service.rs       # ChatService: message processing, LLM invocation, SSE broadcast
     config.rs             # Config file parsing
     context.rs            # Task-local CURRENT_USER_ID for per-user tool isolation
     error.rs              # API error types (thiserror + anyhow)

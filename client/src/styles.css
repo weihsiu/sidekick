@@ -463,12 +463,14 @@ body {
 .ai .message-content h1 { font-size: 1.2em; }
 .ai .message-content h2 { font-size: 1.1em; }
 .ai .message-content h3 { font-size: 1.05em; }
-.ai .message-content a {
+.ai .message-content a,
+.human .message-content a {
   color: #38bdf8;
   text-decoration: underline;
   text-decoration-color: rgba(56, 189, 248, 0.4);
 }
-.ai .message-content a:hover {
+.ai .message-content a:hover,
+.human .message-content a:hover {
   text-decoration-color: #38bdf8;
 }
 .ai .message-content hr {

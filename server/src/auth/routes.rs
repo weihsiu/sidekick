@@ -104,7 +104,7 @@ pub async fn callback(
     .await?;
 
     // Open the per-user database and write profile + tokens.
-    let user_mem = state.pool.get(&user.id).await?;
+    let user_mem = state.chat_service.pool().get(&user.id).await?;
 
     user_mem.history.upsert_profile(
         &oauth_result.user_info.name,
@@ -194,7 +194,7 @@ pub async fn me(
     .await
     .unwrap_or_default();
 
-    let user_mem = state.pool.get(&user.id).await?;
+    let user_mem = state.chat_service.pool().get(&user.id).await?;
     let profile = user_mem.history.get_profile().await?;
 
     let (name, email, first_name, last_name, picture, locale) = match profile {

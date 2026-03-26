@@ -5631,6 +5631,7 @@ dependencies = [
  "axum-login",
  "base64",
  "chrono",
+ "dashmap",
  "dotenvy",
  "futures",
  "lance-index",
@@ -5647,6 +5648,7 @@ dependencies = [
  "synaptic",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "toml",
  "tower",
  "tower-http",
@@ -6828,6 +6830,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

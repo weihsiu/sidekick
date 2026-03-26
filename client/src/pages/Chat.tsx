@@ -34,6 +34,8 @@ export function ChatPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  // true while the AI is processing any message (shown on all connected clients)
+  const [typing, setTyping] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -73,6 +75,38 @@ export function ChatPage() {
       setLoadingHistory(false);
     }
   }, [loadingHistory]);
+
+  // SSE connection — receives human messages and AI responses for this user
+  // across all connected clients.
+  useEffect(() => {
+    if (!user) return;
+    const es = new EventSource("/v1/events");
+
+    es.onmessage = (e) => {
+      const event = JSON.parse(e.data) as {
+        type: "human_message" | "ai_response";
+        id: number;
+        content: string;
+        timestamp: string;
+      };
+      if (event.type === "human_message") {
+        setMessages((prev) => [
+          ...prev,
+          { id: event.id, role: "human", content: event.content, timestamp: event.timestamp },
+        ]);
+        setTyping(true);
+      } else if (event.type === "ai_response") {
+        setMessages((prev) => [
+          ...prev,
+          { id: event.id, role: "ai", content: event.content, timestamp: event.timestamp },
+        ]);
+        setSending(false);
+        setTyping(false);
+      }
+    };
+
+    return () => es.close();
+  }, [user]);
 
   // Load initial history on mount.
   useEffect(() => {
@@ -142,8 +176,6 @@ export function ChatPage() {
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-
-    setMessages((prev) => [...prev, { role: "human", content: text, timestamp: new Date().toISOString() }]);
     setSending(true);
 
     try {
@@ -156,26 +188,16 @@ export function ChatPage() {
       if (!res.ok) {
         const err = await res.text();
         console.error(`Chat API error (${res.status}):`, err);
-        setMessages((prev) => [
-          ...prev,
-          { role: "ai", content: `Error: ${err}` },
-        ]);
-        return;
+        setMessages((prev) => [...prev, { role: "ai", content: `Error: ${err}` }]);
+        setSending(false);
+        setTyping(false);
       }
-
-      const data = await res.json();
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", content: data.response, timestamp: new Date().toISOString() },
-      ]);
+      // On success, human message and AI response arrive via SSE.
     } catch (err) {
       console.error("Chat network error:", err);
-      setMessages((prev) => [
-        ...prev,
-        { role: "ai", content: `Network error: ${err}` },
-      ]);
-    } finally {
+      setMessages((prev) => [...prev, { role: "ai", content: `Network error: ${err}` }]);
       setSending(false);
+      setTyping(false);
     }
   };
 
@@ -230,13 +252,22 @@ export function ChatPage() {
               </div>
               <div className={`message ${msg.role}`}>
                 <div className="message-content">
-                  {msg.role === "ai" ? <Markdown>{msg.content}</Markdown> : msg.content}
+                  {msg.role === "ai" ? (
+                    <Markdown components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> }}>{msg.content}</Markdown>
+                  ) : (
+                    (() => {
+                      const parts = msg.content.split(/(https?:\/\/[^\s]+)/g);
+                      return parts.map((part, j) =>
+                        part.startsWith("http://") || part.startsWith("https://") ? <a key={j} href={part} target="_blank" rel="noopener noreferrer">{part}</a> : part
+                      );
+                    })()
+                  )}
                 </div>
                 {msg.timestamp && <div className="message-time">{formatTimestamp(msg.timestamp)}</div>}
               </div>
             </div>
           ))}
-          {sending && (
+          {(sending || typing) && (
             <div className={`message-wrapper ai`}>
               <div className={`message-avatar ai`}><img src="/icons/icon-192.png" alt="Sidekick" /></div>
               <div className={`message ai`}>
