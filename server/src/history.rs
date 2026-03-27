@@ -202,6 +202,52 @@ impl MemoryHistory {
         Ok(entries)
     }
 
+    /// Fetch entries newer than a cursor, for catch-up after reconnect.
+    ///
+    /// - `after`: only return entries with `id > after`.
+    /// - `limit`: max number of entries to return.
+    /// - `category`: optional filter (e.g. `"conversation"`).
+    ///
+    /// Returns entries in **ascending** order (oldest first).
+    pub async fn fetch_after(
+        &self,
+        after: i64,
+        limit: i64,
+        category: Option<&str>,
+    ) -> Result<Vec<HistoryEntry>> {
+        let rows: Vec<(i64, String, String, String, String, f32)> = match category {
+            Some(cat) => sqlx::query_as(
+                "SELECT id, category, role, content, timestamp, importance FROM memory
+                 WHERE id > ? AND category = ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(after)
+            .bind(cat)
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await?,
+            None => sqlx::query_as(
+                "SELECT id, category, role, content, timestamp, importance FROM memory
+                 WHERE id > ? ORDER BY id ASC LIMIT ?",
+            )
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await?,
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+                id,
+                category,
+                role,
+                content,
+                timestamp,
+                importance,
+            })
+            .collect())
+    }
+
     /// Expose the underlying pool for token operations.
     pub fn pool(&self) -> &SqlitePool {
         &self.db

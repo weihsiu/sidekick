@@ -188,6 +188,11 @@ impl ChatService {
         Ok(())
     }
 
+    /// Remove channels that have no active subscribers.
+    pub fn cleanup_channels(&self) {
+        self.channels.retain(|_, sender| sender.receiver_count() > 0);
+    }
+
     fn broadcast(&self, user_id: &str, event: UserEvent) {
         if let Some(sender) = self.channels.get(user_id) {
             // Ignore send errors — they just mean no clients are connected.

@@ -24,6 +24,13 @@ pub struct ServerConfig {
     /// URL to redirect to after login. Defaults to base_url.
     /// Only set this when the frontend is served separately (e.g. Vite dev server).
     pub frontend_url: Option<String>,
+    /// How often (in minutes) to run background cleanup tasks. Defaults to 5.
+    #[serde(default = "default_cleanup_interval_minutes")]
+    pub cleanup_interval_minutes: u64,
+}
+
+fn default_cleanup_interval_minutes() -> u64 {
+    5
 }
 
 impl ServerConfig {

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import Markdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useAuth } from "../auth";
 
 interface Message {
@@ -44,6 +45,8 @@ export function ChatPage() {
   const headerRef = useRef<HTMLElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const initialLoadDone = useRef(false);
+  const sseConnected = useRef(false);
+  const lastMessageIdRef = useRef<number | undefined>(undefined);
 
   const loadHistory = useCallback(async (before?: number) => {
     if (loadingHistory) return;
@@ -76,11 +79,34 @@ export function ChatPage() {
     }
   }, [loadingHistory]);
 
+  // Keep lastMessageIdRef current so the SSE onopen handler can read it
+  // without stale closure issues.
+  useEffect(() => {
+    const last = [...messages].reverse().find((m) => m.id !== undefined);
+    if (last?.id !== undefined) lastMessageIdRef.current = last.id;
+  }, [messages]);
+
   // SSE connection — receives human messages and AI responses for this user
   // across all connected clients.
   useEffect(() => {
     if (!user) return;
+    sseConnected.current = false;
     const es = new EventSource("/v1/events");
+
+    es.onopen = () => {
+      if (!sseConnected.current) {
+        sseConnected.current = true;
+        return; // initial connect — history already loaded by loadHistory useEffect
+      }
+      // Reconnect: fetch any messages that arrived while offline and append them.
+      const after = lastMessageIdRef.current;
+      if (after === undefined) return;
+      fetch(`/v1/history?after=${after}&category=conversation`)
+        .then((r) => (r.ok ? r.json() : []))
+        .then((missed: Message[]) => {
+          if (missed.length > 0) setMessages((prev) => [...prev, ...missed]);
+        });
+    };
 
     es.onmessage = (e) => {
       const event = JSON.parse(e.data) as {
@@ -253,7 +279,7 @@ export function ChatPage() {
               <div className={`message ${msg.role}`}>
                 <div className="message-content">
                   {msg.role === "ai" ? (
-                    <Markdown components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> }}>{msg.content}</Markdown>
+                    <Markdown remarkPlugins={[remarkGfm]} components={{ a: ({ href, children }) => <a href={href} target="_blank" rel="noopener noreferrer">{children}</a> }}>{msg.content}</Markdown>
                   ) : (
                     (() => {
                       const parts = msg.content.split(/(https?:\/\/[^\s]+)/g);

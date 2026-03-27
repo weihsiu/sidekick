@@ -161,6 +161,7 @@ struct MessageResponse {
 #[derive(Deserialize)]
 struct HistoryQuery {
     before: Option<i64>,
+    after: Option<i64>,
     limit: Option<i64>,
     category: Option<String>,
 }
@@ -288,7 +289,11 @@ async fn history_handler(
 
     let limit = params.limit.unwrap_or(20).min(100);
     let category = params.category.as_deref();
-    let entries = user_mem.history.fetch(params.before, limit, category).await?;
+    let entries = if let Some(after) = params.after {
+        user_mem.history.fetch_after(after, limit, category).await?
+    } else {
+        user_mem.history.fetch(params.before, limit, category).await?
+    };
     Ok(Json(entries))
 }
 
@@ -441,6 +446,21 @@ async fn main() -> anyhow::Result<()> {
         cfg.agent.system_prompt,
         tool_failure_count,
     ));
+
+    // Background cleanup task: evict broadcast channels with no active subscribers.
+    {
+        let svc = Arc::clone(&chat_service);
+        let interval_secs = cfg.server.cleanup_interval_minutes * 60;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+            ticker.tick().await; // skip immediate first tick
+            loop {
+                ticker.tick().await;
+                svc.cleanup_channels();
+                tracing::debug!("cleaned up inactive broadcast channels");
+            }
+        });
+    }
 
     let state = Arc::new(AppState {
         chat_service,
