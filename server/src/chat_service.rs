@@ -110,8 +110,7 @@ impl ChatService {
         // Persist and broadcast the human message immediately so all clients
         // see it without waiting for the LLM.
         let human_id = user_mem
-            .history
-            .append("conversation", "human", message, &now, 5.0)
+            .store("conversation", "human", message, &now, 5.0)
             .await?;
         self.broadcast(user_id, UserEvent::HumanMessage {
             id: human_id,
@@ -157,13 +156,7 @@ impl ChatService {
 
         // Persist AI response to SQLite, LanceDB, and the chat window.
         let ai_id = user_mem
-            .history
-            .append("conversation", "ai", &response, &now, importance)
-            .await?;
-        let combined = format!("User: {}\nAssistant: {}", message, response);
-        user_mem
-            .semantic
-            .store("conversation", "conversation", &combined, importance)
+            .store("conversation", "ai", &response, &now, importance)
             .await?;
         user_mem
             .semantic

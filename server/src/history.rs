@@ -3,6 +3,7 @@ use serde::Serialize;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 
+use crate::migrations;
 use crate::user::UserProfile;
 
 /// A single memory entry stored in the history database.
@@ -19,6 +20,7 @@ pub struct HistoryEntry {
 /// Per-user memory history backed by SQLite.
 ///
 /// Provides ordered, cursor-based pagination for infinite scroll.
+/// Also owns the FTS5 index over memory content.
 pub struct MemoryHistory {
     db: SqlitePool,
 }
@@ -91,10 +93,12 @@ impl MemoryHistory {
         .await
         .context("failed to create memory table")?;
 
+        migrations::run_sqlite_migrations(&db).await?;
+
         Ok(Self { db })
     }
 
-    /// Append an entry to the memory history.
+    /// Append an entry to the memory history and update the FTS index.
     pub async fn append(
         &self,
         category: &str,
@@ -117,6 +121,98 @@ impl MemoryHistory {
         .context("failed to insert memory history entry")?;
 
         Ok(row.0)
+    }
+
+    /// Full-text search over memory content.
+    ///
+    /// Returns SQLite row ids ordered by BM25 relevance (best match first).
+    /// Returns an empty list if the query is empty or FTS fails to parse it.
+    pub async fn fts_search(
+        &self,
+        query: &str,
+        categories: Option<&[&str]>,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows: Vec<(i64,)> = if let Some(cats) = categories {
+            let placeholders = cats.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT rowid FROM memory_fts
+                 WHERE memory_fts MATCH ? AND category IN ({placeholders})
+                 ORDER BY rank LIMIT ?",
+            );
+            let mut q = sqlx::query_as::<_, (i64,)>(&sql).bind(query);
+            for cat in cats {
+                q = q.bind(*cat);
+            }
+            q.bind(limit as i64).fetch_all(&self.db).await
+        } else {
+            sqlx::query_as(
+                "SELECT rowid FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
+            )
+            .bind(query)
+            .bind(limit as i64)
+            .fetch_all(&self.db)
+            .await
+        }
+        .unwrap_or_default(); // silently return empty on FTS parse errors
+
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Fetch memory entries by their SQLite ids.
+    ///
+    /// The returned order is undefined — callers should sort as needed.
+    pub async fn fetch_by_ids(&self, ids: &[i64]) -> Result<Vec<HistoryEntry>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT id, category, role, content, timestamp, importance
+             FROM memory WHERE id IN ({placeholders})",
+        );
+        let mut q = sqlx::query_as::<_, (i64, String, String, String, String, f32)>(&sql);
+        for id in ids {
+            q = q.bind(*id);
+        }
+        let rows = q.fetch_all(&self.db).await.context("failed to fetch entries by id")?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+                id,
+                category,
+                role,
+                content,
+                timestamp,
+                importance,
+            })
+            .collect())
+    }
+
+    /// Fetch every row in the memory table, ordered by id ascending.
+    pub async fn fetch_all(&self) -> Result<Vec<HistoryEntry>> {
+        let rows: Vec<(i64, String, String, String, String, f32)> = sqlx::query_as(
+            "SELECT id, category, role, content, timestamp, importance FROM memory ORDER BY id ASC",
+        )
+        .fetch_all(&self.db)
+        .await
+        .context("failed to fetch all memory entries")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+                id,
+                category,
+                role,
+                content,
+                timestamp,
+                importance,
+            })
+            .collect())
     }
 
     /// Returns true if the memory table has no entries.
@@ -204,10 +300,6 @@ impl MemoryHistory {
 
     /// Fetch entries newer than a cursor, for catch-up after reconnect.
     ///
-    /// - `after`: only return entries with `id > after`.
-    /// - `limit`: max number of entries to return.
-    /// - `category`: optional filter (e.g. `"conversation"`).
-    ///
     /// Returns entries in **ascending** order (oldest first).
     pub async fn fetch_after(
         &self,
@@ -263,7 +355,6 @@ impl MemoryHistory {
         picture: &str,
         locale: &str,
     ) -> Result<()> {
-        // Ensure only one row exists by deleting first.
         sqlx::query("DELETE FROM profile")
             .execute(&self.db)
             .await
@@ -305,4 +396,3 @@ impl MemoryHistory {
         }))
     }
 }
-

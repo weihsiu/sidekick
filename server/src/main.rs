@@ -6,6 +6,7 @@ mod embeddings;
 mod error;
 mod history;
 mod memory;
+mod migrations;
 mod provider;
 mod rerank;
 mod tools;
@@ -215,9 +216,8 @@ async fn store_handler(
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
     let user_mem = state.chat_service.pool().get(&user.id).await?;
-    user_mem.semantic.store(&req.category, &req.role, &req.content, req.importance).await?;
     let now = chrono::Utc::now().to_rfc3339();
-    user_mem.history.append(&req.category, &req.role, &req.content, &now, req.importance).await?;
+    user_mem.store(&req.category, &req.role, &req.content, &now, req.importance).await?;
 
     Ok(Json(MessageResponse {
         message: "stored".to_string(),
@@ -238,7 +238,7 @@ async fn search_handler(
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
 
-    let entries = user_mem.semantic.retrieve(&req.query, cat_refs.as_deref()).await?;
+    let entries = user_mem.retrieve(&req.query, cat_refs.as_deref()).await?;
 
     let entries: Vec<SearchEntry> = entries
         .into_iter()
@@ -271,13 +271,13 @@ async fn history_handler(
 
         let name_fact = format!("The user's name is {}.", display_name);
         let now = chrono::Utc::now().to_rfc3339();
-        user_mem.semantic.store("knowledge", "system", &name_fact, 10.0).await?;
-        user_mem.history.append("knowledge", "system", &name_fact, &now, 10.0).await?;
+        user_mem.store("knowledge", "system", &name_fact, &now, 10.0).await?;
 
         let welcome = format!(
             "Welcome to Sidekick, {}! I'm your AI assistant with long-term memory. How can I help you today?",
             first_name
         );
+        // Welcome message goes to history only — not worth embedding.
         user_mem.history.append("conversation", "ai", &welcome, &now, 1.0).await?;
         user_mem
             .semantic
@@ -377,26 +377,20 @@ async fn main() -> anyhow::Result<()> {
     if args.len() >= 4 && args[1] == "--import" {
         let user_id = &args[2];
         let file_path = Path::new(&args[3]);
-        let db_path = format!("{}/{}.lancedb", cfg.memory.base_path, user_id);
-        let mem = memory::SemanticMemory::new(
-            &db_path,
-            &cfg.memory.table_name,
+        let pool = memory::UserStorePool::new(
+            &cfg.memory,
             emb,
             reranker,
             cfg.embeddings.dimensions,
-            cfg.memory.top_k,
             cfg.rerank.top_n,
             cfg.rerank.category_weights,
-            cfg.memory.chat_window,
-        )
-        .await?;
-        let hist_db_path = format!("{}/{}.memory.db", cfg.memory.base_path, user_id);
-        let hist = history::MemoryHistory::new(&hist_db_path).await?;
+        )?;
+        let user_mem = pool.get(user_id).await?;
         println!(
             "Importing from {} for user '{user_id}'...",
             file_path.display()
         );
-        let count = mem.import_jsonl(file_path, &hist).await?;
+        let count = user_mem.import_jsonl(file_path).await?;
         println!("Imported {count} entries.");
         return Ok(());
     }

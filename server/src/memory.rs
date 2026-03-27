@@ -6,8 +6,6 @@ use arrow_array::types::Float32Type;
 use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lance_index::scalar::FullTextSearchQuery;
-use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lru::LruCache;
 use serde::Deserialize;
@@ -17,28 +15,17 @@ use synaptic::store::InMemoryStore;
 use tokio::sync::Mutex;
 
 use crate::config::MemoryConfig;
-use crate::history::MemoryHistory;
+use crate::history::{HistoryEntry, MemoryHistory};
+use crate::migrations;
 use crate::rerank::Reranker;
-
-/// A single entry stored in memory.
-#[derive(Debug, Clone)]
-pub struct MemoryEntry {
-    pub category: String,
-    pub role: String,
-    pub content: String,
-    pub timestamp: String,
-    pub importance: f32,
-}
 
 /// A record in a JSONL import file.
 #[derive(Debug, Deserialize)]
 pub struct ImportRecord {
     pub category: String,
     pub content: String,
-    /// Optional role — defaults to "system" for imported knowledge.
     #[serde(default = "default_role")]
     pub role: String,
-    /// Optional importance — defaults to 5.0.
     #[serde(default = "default_importance")]
     pub importance: f32,
 }
@@ -51,13 +38,38 @@ fn default_importance() -> f32 {
     5.0
 }
 
-/// Persistent semantic memory backed by LanceDB.
+/// Format retrieved memory entries into a context string for the system prompt.
+pub fn format_context(entries: &[HistoryEntry]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    let mut ctx = String::from("Relevant context from memory:\n\n");
+    for entry in entries {
+        let role_label = match entry.role.as_str() {
+            "human" => "User",
+            "ai" => "Assistant",
+            "system" => "Knowledge",
+            other => other,
+        };
+        ctx.push_str(&format!(
+            "[{}] [{}] {}: {}\n",
+            entry.timestamp, entry.category, role_label, entry.content
+        ));
+    }
+    ctx
+}
+
+// ---------------------------------------------------------------------------
+// SemanticMemory — pure vector index backed by LanceDB
+// ---------------------------------------------------------------------------
+
+/// Semantic memory backed by LanceDB.
 ///
-/// Thread-safe: a write lock serialises `store` and FTS index rebuilds,
-/// while reads proceed concurrently without contention.
+/// Stores only the embedding vector plus enough metadata for filtering.
+/// All plaintext lives in SQLite (`MemoryHistory`).
 ///
-/// Also holds a short-term chat window (last N messages sent to the LLM
-/// as message history).
+/// Also holds the short-term chat window (last N messages passed to the LLM).
 pub struct SemanticMemory {
     table: lancedb::Table,
     embeddings: Arc<dyn Embeddings>,
@@ -66,17 +78,21 @@ pub struct SemanticMemory {
     top_k: usize,
     rerank_top_n: usize,
     category_weights: HashMap<String, f32>,
-    /// Serialises writes so concurrent `store` calls don't race on FTS rebuilds.
-    write_lock: Mutex<()>,
     /// Short-term chat window backed by synaptic's conversation window.
     pub chat_memory: Arc<ConversationWindowMemory>,
 }
 
 impl SemanticMemory {
     /// Connect to (or create) the LanceDB table for semantic memory.
+    ///
+    /// If `needs_reset` is true the existing table is dropped and recreated.
+    /// The caller is responsible for determining whether a reset is needed
+    /// (via `migrations::lancedb_needs_reset`) and for recording the new
+    /// version afterwards (via `migrations::mark_lancedb_current`).
     pub async fn new(
         db_path: &str,
         table_name: &str,
+        needs_reset: bool,
         embeddings: Arc<dyn Embeddings>,
         reranker: Arc<dyn Reranker>,
         dim: usize,
@@ -95,15 +111,20 @@ impl SemanticMemory {
 
         let schema = Self::schema(dim);
         let existing = db.table_names().execute().await?;
+
+        if needs_reset && existing.contains(&table_name.to_string()) {
+            tracing::info!("LanceDB schema version changed — dropping table '{table_name}'");
+            db.drop_table(table_name, &[]).await?;
+        }
+
+        let existing = db.table_names().execute().await?;
         let table = if existing.contains(&table_name.to_string()) {
             db.open_table(table_name).execute().await?
         } else {
-            db.create_empty_table(table_name, schema)
-                .execute()
-                .await?
+            db.create_empty_table(table_name, schema).execute().await?
         };
 
-        let mem = Self {
+        Ok(Self {
             table,
             embeddings,
             reranker,
@@ -111,28 +132,17 @@ impl SemanticMemory {
             top_k,
             rerank_top_n,
             category_weights,
-            write_lock: Mutex::new(()),
             chat_memory: Arc::new(ConversationWindowMemory::new(
                 Arc::new(ChatMessageHistory::new(Arc::new(InMemoryStore::new()))),
                 chat_window_size,
             )),
-        };
-
-        // Ensure the FTS index exists so hybrid search works on existing data.
-        if mem.table.count_rows(None).await? > 0 {
-            mem.rebuild_fts_index().await?;
-        }
-
-        Ok(mem)
+        })
     }
 
     fn schema(dim: usize) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("category", DataType::Utf8, false),
-            Field::new("role", DataType::Utf8, false),
-            Field::new("content", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Utf8, false),
             Field::new("importance", DataType::Float32, false),
             Field::new(
                 "vector",
@@ -145,51 +155,14 @@ impl SemanticMemory {
         ]))
     }
 
-    /// Rebuild the full-text search index on the content column.
-    async fn rebuild_fts_index(&self) -> Result<()> {
-        self.table
-            .create_index(&["content"], Index::FTS(Default::default()))
-            .replace(true)
-            .execute()
-            .await
-            .context("failed to rebuild FTS index")?;
-        Ok(())
-    }
-
-    /// Store a single entry in memory (thread-safe).
-    pub async fn store(
+    /// Store a vector for a SQLite memory entry.
+    ///
+    /// The `sqlite_id` is the primary key from the memory table and is used
+    /// to join back to the content when retrieving.
+    pub async fn store_vector(
         &self,
+        sqlite_id: i64,
         category: &str,
-        role: &str,
-        content: &str,
-        importance: f32,
-    ) -> Result<()> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-
-        // Compute embedding outside the lock — this is the slow part.
-        let embedding = self
-            .embeddings
-            .embed_query(content)
-            .await
-            .context("failed to compute embedding")?;
-
-        let _guard = self.write_lock.lock().await;
-        self.insert_row(category, role, content, &id, &timestamp, importance, embedding)
-            .await?;
-        self.rebuild_fts_index().await?;
-
-        Ok(())
-    }
-
-    /// Insert a row with a precomputed embedding.
-    async fn insert_row(
-        &self,
-        category: &str,
-        role: &str,
-        content: &str,
-        id: &str,
-        timestamp: &str,
         importance: f32,
         embedding: Vec<f32>,
     ) -> Result<()> {
@@ -197,112 +170,36 @@ impl SemanticMemory {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec![id])),
+                Arc::new(StringArray::from(vec![sqlite_id.to_string()])),
                 Arc::new(StringArray::from(vec![category])),
-                Arc::new(StringArray::from(vec![role])),
-                Arc::new(StringArray::from(vec![content])),
-                Arc::new(StringArray::from(vec![timestamp])),
                 Arc::new(Float32Array::from(vec![importance])),
-                Arc::new(
-                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                        vec![Some(embedding.into_iter().map(Some).collect::<Vec<_>>())],
-                        self.dim as i32,
-                    ),
-                ),
+                Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                    vec![Some(embedding.into_iter().map(Some).collect::<Vec<_>>())],
+                    self.dim as i32,
+                )),
             ],
         )?;
 
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
         self.table.add(batches).execute().await?;
-
         Ok(())
     }
 
-    /// Import entries from a JSONL file. Writes to both LanceDB and the
-    /// SQLite memory history. Rebuilds the FTS index once at the end.
-    pub async fn import_jsonl(
-        &self,
-        path: &std::path::Path,
-        history: &MemoryHistory,
-    ) -> Result<usize> {
-        let file_content = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read import file: {}", path.display()))?;
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        let mut count = 0;
-
-        let _guard = self.write_lock.lock().await;
-
-        for (line_num, line) in file_content.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            let record: ImportRecord = serde_json::from_str(line)
-                .with_context(|| format!("invalid JSON on line {}", line_num + 1))?;
-
-            let id = uuid::Uuid::new_v4().to_string();
-            let embedding = self
-                .embeddings
-                .embed_query(&record.content)
-                .await
-                .with_context(|| format!("embedding failed on line {}", line_num + 1))?;
-            self.insert_row(
-                &record.category,
-                &record.role,
-                &record.content,
-                &id,
-                &timestamp,
-                record.importance,
-                embedding,
-            )
-            .await?;
-
-            history
-                .append(&record.category, &record.role, &record.content, &timestamp, record.importance)
-                .await
-                .with_context(|| format!("history insert failed on line {}", line_num + 1))?;
-
-            count += 1;
-        }
-
-        if count > 0 {
-            self.rebuild_fts_index().await?;
-        }
-
-        Ok(count)
-    }
-
-    /// Retrieve the most relevant past entries for a query, optionally filtered
-    /// by categories.
+    /// Vector similarity search.
     ///
-    /// Uses hybrid search: dense vector (cosine similarity) + sparse full-text
-    /// search on the content column, fused via Reciprocal Rank Fusion (RRF).
-    pub async fn retrieve(
+    /// Returns SQLite row ids ordered by cosine similarity (most similar first).
+    pub async fn vector_search(
         &self,
-        query: &str,
+        embedding: Vec<f32>,
         categories: Option<&[&str]>,
-    ) -> Result<Vec<MemoryEntry>> {
-        // On an empty table, vector search would fail — return early.
-        let row_count = self.table.count_rows(None).await?;
-        if row_count == 0 {
-            return Ok(Vec::new());
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        if self.table.count_rows(None).await? == 0 {
+            return Ok(vec![]);
         }
 
-        let query_vec = self
-            .embeddings
-            .embed_query(query)
-            .await
-            .context("failed to embed query")?;
-        let fts_query = FullTextSearchQuery::new(query.to_string());
+        let mut builder = self.table.query().nearest_to(embedding)?;
 
-        let mut builder = self
-            .table
-            .query()
-            .full_text_search(fts_query)
-            .nearest_to(query_vec)?;
-
-        // Optionally filter by categories.
         if let Some(cats) = categories {
             let cat_list: Vec<String> = cats
                 .iter()
@@ -312,92 +209,238 @@ impl SemanticMemory {
         }
 
         let results: Vec<RecordBatch> = builder
-            .limit(self.top_k)
+            .limit(limit)
             .distance_type(lancedb::DistanceType::Cosine)
             .execute()
             .await?
             .try_collect::<Vec<_>>()
             .await?;
 
-        let mut entries = Vec::new();
+        let mut ids = Vec::new();
         for batch in &results {
-            let categories = batch
-                .column_by_name("category")
-                .unwrap()
+            let ids_col = batch
+                .column_by_name("id")
+                .context("missing id column in LanceDB result")?
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .unwrap();
-            let roles = batch
-                .column_by_name("role")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let contents = batch
-                .column_by_name("content")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let timestamps = batch
-                .column_by_name("timestamp")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let importances = batch
-                .column_by_name("importance")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .unwrap();
-
+                .context("id column is not StringArray")?;
             for i in 0..batch.num_rows() {
-                entries.push(MemoryEntry {
-                    category: categories.value(i).to_string(),
-                    role: roles.value(i).to_string(),
-                    content: contents.value(i).to_string(),
-                    timestamp: timestamps.value(i).to_string(),
-                    importance: importances.value(i),
-                });
+                if let Ok(id) = ids_col.value(i).parse::<i64>() {
+                    ids.push(id);
+                }
             }
         }
 
-        // Rerank to surface the most relevant entries, then apply category and importance weights.
+        Ok(ids)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UserStore — coordinates SQLite + LanceDB for a single user
+// ---------------------------------------------------------------------------
+
+/// Per-user memory bundle: LanceDB (vector index) + SQLite (content + FTS).
+pub struct UserStore {
+    pub semantic: SemanticMemory,
+    pub history: MemoryHistory,
+}
+
+impl UserStore {
+    /// Store a memory entry.
+    ///
+    /// Writes to SQLite first (authoritative). Then embeds the content and
+    /// writes the vector to LanceDB. If LanceDB fails the entry is still
+    /// persisted in SQLite and FTS — it just won't appear in vector search.
+    pub async fn store(
+        &self,
+        category: &str,
+        role: &str,
+        content: &str,
+        timestamp: &str,
+        importance: f32,
+    ) -> Result<i64> {
+        let id = self
+            .history
+            .append(category, role, content, timestamp, importance)
+            .await?;
+
+        match self.semantic.embeddings.embed_query(content).await {
+            Ok(embedding) => {
+                if let Err(e) = self
+                    .semantic
+                    .store_vector(id, category, importance, embedding)
+                    .await
+                {
+                    tracing::warn!("failed to store vector for entry {id}: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to embed entry {id}: {e}");
+            }
+        }
+
+        Ok(id)
+    }
+
+    /// Retrieve the most relevant memory entries for a query.
+    ///
+    /// Runs vector search (LanceDB) and FTS (SQLite) in parallel, merges
+    /// results via RRF, fetches content from SQLite, then reranks.
+    pub async fn retrieve(
+        &self,
+        query: &str,
+        categories: Option<&[&str]>,
+    ) -> Result<Vec<HistoryEntry>> {
+        let top_k = self.semantic.top_k;
+
+        let embedding = self
+            .semantic
+            .embeddings
+            .embed_query(query)
+            .await
+            .context("failed to embed query")?;
+
+        let (vector_ids, fts_ids) = tokio::join!(
+            self.semantic.vector_search(embedding, categories, top_k),
+            self.history.fts_search(query, categories, top_k),
+        );
+
+        let vector_ids = vector_ids.unwrap_or_default();
+        let fts_ids = fts_ids.unwrap_or_default();
+
+        if vector_ids.is_empty() && fts_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let merged = rrf_merge(&vector_ids, &fts_ids, 60.0);
+        let merged = &merged[..merged.len().min(top_k)];
+
+        let entries = self.history.fetch_by_ids(merged).await?;
+        if entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Rerank using the cross-encoder.
         let docs: Vec<&str> = entries.iter().map(|e| e.content.as_str()).collect();
-        let mut ranked = self.reranker.rerank(query, &docs, entries.len()).await?;
+        let mut ranked = self
+            .semantic
+            .reranker
+            .rerank(query, &docs, entries.len())
+            .await?;
+
+        // Apply category and importance weights on top of reranker scores.
         for r in &mut ranked {
             let cat_weight = self
+                .semantic
                 .category_weights
                 .get(&entries[r.index].category)
                 .copied()
                 .unwrap_or(1.0);
-            // Normalize importance (1-10) to a multiplier (0.5-1.5).
             let imp = entries[r.index].importance.clamp(1.0, 10.0);
             let imp_weight = 0.5 + (imp - 1.0) / 9.0;
             r.score *= cat_weight * imp_weight;
         }
         ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(self.rerank_top_n);
-        let entries: Vec<MemoryEntry> =
+        ranked.truncate(self.semantic.rerank_top_n);
+
+        let mut result: Vec<HistoryEntry> =
             ranked.into_iter().map(|r| entries[r.index].clone()).collect();
 
-        // Sort by timestamp so context reads chronologically.
-        let mut entries = entries;
-        entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        // Sort chronologically so the LLM sees context in order.
+        result.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-        Ok(entries)
+        Ok(result)
+    }
+
+    /// Re-embed all SQLite memory entries into LanceDB.
+    ///
+    /// Called after a LanceDB schema reset to restore search coverage.
+    /// Failures on individual rows are logged and skipped so a single bad
+    /// entry does not abort the whole reindex.
+    pub async fn reindex(&self) -> Result<()> {
+        let entries = self.history.fetch_all().await?;
+        let total = entries.len();
+        tracing::info!("reindexing {total} entries into LanceDB");
+
+        for entry in entries {
+            match self.semantic.embeddings.embed_query(&entry.content).await {
+                Ok(embedding) => {
+                    if let Err(e) = self
+                        .semantic
+                        .store_vector(entry.id, &entry.category, entry.importance, embedding)
+                        .await
+                    {
+                        tracing::warn!("reindex: failed to store vector for entry {}: {e}", entry.id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("reindex: failed to embed entry {}: {e}", entry.id);
+                }
+            }
+        }
+
+        tracing::info!("reindex complete");
+        Ok(())
+    }
+
+    /// Import entries from a JSONL file into both SQLite and LanceDB.
+    ///
+    /// Each line must be a JSON object with `category`, `content`, and
+    /// optional `role` (default "system") and `importance` (default 5.0).
+    pub async fn import_jsonl(&self, path: &std::path::Path) -> Result<usize> {
+        let file_content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read import file: {}", path.display()))?;
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let mut count = 0;
+
+        for (line_num, line) in file_content.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let record: ImportRecord = serde_json::from_str(line)
+                .with_context(|| format!("invalid JSON on line {}", line_num + 1))?;
+
+            self.store(
+                &record.category,
+                &record.role,
+                &record.content,
+                &timestamp,
+                record.importance,
+            )
+            .await
+            .with_context(|| format!("failed to store entry on line {}", line_num + 1))?;
+
+            count += 1;
+        }
+
+        Ok(count)
     }
 }
 
-/// Per-user memory bundle: LanceDB (semantic search) + SQLite (browsing/history).
+// ---------------------------------------------------------------------------
+// Reciprocal Rank Fusion
+// ---------------------------------------------------------------------------
+
+/// Merge two ranked id lists into a single ranking via RRF.
 ///
-/// Both databases are opened and evicted together so a single LRU slot
-/// controls the file-handle footprint for each user.
-pub struct UserStore {
-    pub semantic: SemanticMemory,
-    pub history: MemoryHistory,
+/// k=60 is the standard constant from the original RRF paper.
+fn rrf_merge(list_a: &[i64], list_b: &[i64], k: f64) -> Vec<i64> {
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for (rank, id) in list_a.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (k + rank as f64 + 1.0);
+    }
+    for (rank, id) in list_b.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (k + rank as f64 + 1.0);
+    }
+    let mut ids: Vec<(i64, f64)> = scores.into_iter().collect();
+    ids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ids.into_iter().map(|(id, _)| id).collect()
 }
+
+// ---------------------------------------------------------------------------
+// UserStorePool — LRU pool of per-user UserStore instances
+// ---------------------------------------------------------------------------
 
 /// LRU pool of per-user `UserStore` instances.
 ///
@@ -425,8 +468,12 @@ impl UserStorePool {
         rerank_top_n: usize,
         category_weights: HashMap<String, f32>,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&config.base_path)
-            .with_context(|| format!("failed to create memory base directory: {}", config.base_path))?;
+        std::fs::create_dir_all(&config.base_path).with_context(|| {
+            format!(
+                "failed to create memory base directory: {}",
+                config.base_path
+            )
+        })?;
 
         let cap = std::num::NonZeroUsize::new(config.pool_size)
             .context("pool_size must be > 0")?;
@@ -447,7 +494,6 @@ impl UserStorePool {
 
     /// Get or create a `UserStore` for the given user.
     pub async fn get(&self, user_id: &str) -> Result<Arc<UserStore>> {
-        // Fast path: check the cache.
         {
             let mut cache = self.cache.lock().await;
             if let Some(mem) = cache.get(user_id) {
@@ -455,13 +501,23 @@ impl UserStorePool {
             }
         }
 
-        // Slow path: open/create both databases outside the cache lock.
         let lance_path = format!("{}/{}.lancedb", self.base_path, user_id);
         let sqlite_path = format!("{}/{}.db", self.base_path, user_id);
+
+        // Open SQLite first — migrations run here, and the LanceDB version
+        // is stored in the meta table which migrations ensure exists.
+        let history = MemoryHistory::new(&sqlite_path)
+            .await
+            .with_context(|| format!("failed to open memory history for user '{user_id}'"))?;
+
+        let needs_reset = migrations::lancedb_needs_reset(history.pool())
+            .await
+            .with_context(|| format!("failed to check lancedb version for user '{user_id}'"))?;
 
         let semantic = SemanticMemory::new(
             &lance_path,
             &self.table_name,
+            needs_reset,
             Arc::clone(&self.embeddings),
             Arc::clone(&self.reranker),
             self.dim,
@@ -473,11 +529,16 @@ impl UserStorePool {
         .await
         .with_context(|| format!("failed to open semantic memory for user '{user_id}'"))?;
 
-        let history = MemoryHistory::new(&sqlite_path)
-            .await
-            .with_context(|| format!("failed to open memory history for user '{user_id}'"))?;
-
         let user_mem = Arc::new(UserStore { semantic, history });
+
+        if needs_reset {
+            migrations::mark_lancedb_current(user_mem.history.pool())
+                .await
+                .with_context(|| format!("failed to mark lancedb current for user '{user_id}'"))?;
+            if let Err(e) = user_mem.reindex().await {
+                tracing::warn!("reindex failed for user '{user_id}': {e}");
+            }
+        }
 
         let mut cache = self.cache.lock().await;
         if let Some(existing) = cache.get(user_id) {
@@ -487,26 +548,4 @@ impl UserStorePool {
 
         Ok(user_mem)
     }
-}
-
-/// Format retrieved memory entries into a context string for the system prompt.
-pub fn format_context(entries: &[MemoryEntry]) -> String {
-    if entries.is_empty() {
-        return String::new();
-    }
-
-    let mut ctx = String::from("Relevant context from memory:\n\n");
-    for entry in entries {
-        let role_label = match entry.role.as_str() {
-            "human" => "User",
-            "ai" => "Assistant",
-            "system" => "Knowledge",
-            other => other,
-        };
-        ctx.push_str(&format!(
-            "[{}] [{}] {}: {}\n",
-            entry.timestamp, entry.category, role_label, entry.content
-        ));
-    }
-    ctx
 }

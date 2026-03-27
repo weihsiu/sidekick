@@ -58,7 +58,6 @@ impl Tool for RecallMemory {
             .map_err(|e| SynapticError::Tool(format!("failed to access memory: {e}")))?;
 
         let entries = user_mem
-            .semantic
             .retrieve(query, None)
             .await
             .map_err(|e| SynapticError::Tool(format!("memory search failed: {e}")))?;
