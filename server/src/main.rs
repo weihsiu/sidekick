@@ -9,6 +9,7 @@ mod memory;
 mod migrations;
 mod provider;
 mod rerank;
+mod stt;
 mod tools;
 mod user;
 
@@ -46,6 +47,7 @@ use auth::AuthBackend;
 use auth::routes::require_user;
 use chat_service::ChatService;
 use error::ApiError;
+use stt::SttClient;
 
 type Jar = PrivateCookieJar<CookieKey>;
 
@@ -103,6 +105,7 @@ impl From<CookieKey> for Key {
 struct AppState {
     chat_service: Arc<ChatService>,
     cookie_key: CookieKey,
+    stt: Option<Arc<SttClient>>,
 }
 
 impl axum::extract::FromRef<Arc<AppState>> for CookieKey {
@@ -201,11 +204,78 @@ async fn chat_handler(
     Json(req): Json<ChatRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user = require_user(&mut auth_session, &jar).await?;
-    state
+
+    // Persist the human message synchronously so it's immediately visible,
+    // then return 202 right away. LLM work runs in the background to avoid
+    // HTTP timeouts on slow responses.
+    let now = state
         .chat_service
-        .process_message(&user.id, &req.message, req.local_time.as_deref())
+        .persist_human_message(&user.id, &req.message)
         .await?;
-    Ok(StatusCode::OK)
+
+    let chat_service = Arc::clone(&state.chat_service);
+    let user_id = user.id.clone();
+    let message = req.message.clone();
+    let local_time = req.local_time.clone();
+    tokio::spawn(async move {
+        if let Err(e) = chat_service.run_llm(&user_id, &message, local_time.as_deref(), &now).await {
+            tracing::error!("LLM processing failed for {user_id}: {e:#}");
+            chat_service.broadcast_error(&user_id, "AI processing failed. Please try again.");
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Voice input: transcribe audio then immediately persist the human message,
+/// broadcast it via SSE, and spawn LLM processing — all in one request.
+/// The client never needs to make a separate /v1/chat call for voice input.
+async fn voice_handler(
+    mut auth_session: AuthSession<AuthBackend>,
+    jar: Jar,
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = require_user(&mut auth_session, &jar).await?;
+
+    let stt = state
+        .stt
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("STT is not configured")))?;
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/webm");
+
+    let transcript = stt
+        .transcribe(body.to_vec(), content_type)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let transcript = state.chat_service.convert(transcript.trim());
+    if transcript.is_empty() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+
+    // Persist human message and broadcast it via SSE immediately.
+    let now = state
+        .chat_service
+        .persist_human_message(&user.id, &transcript)
+        .await?;
+
+    // Spawn LLM in background — response arrives via SSE.
+    let chat_service = Arc::clone(&state.chat_service);
+    let user_id = user.id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = chat_service.run_llm(&user_id, &transcript, None, &now).await {
+            tracing::error!("LLM processing failed for {user_id}: {e:#}");
+            chat_service.broadcast_error(&user_id, "AI processing failed. Please try again.");
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn store_handler(
@@ -456,15 +526,27 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let stt = cfg.stt.as_ref().and_then(|s| {
+        match s.api_key() {
+            Ok(key) => Some(Arc::new(SttClient::new(key, s.model.clone(), s.endpoint()))),
+            Err(e) => {
+                tracing::warn!("STT disabled: {e}");
+                None
+            }
+        }
+    });
+
     let state = Arc::new(AppState {
         chat_service,
         cookie_key: CookieKey(cookie_key),
+        stt,
     });
 
     // --- Routes ---
     let api_routes = Router::new()
         .route("/v1/events", get(sse_handler))
         .route("/v1/chat", post(chat_handler))
+        .route("/v1/voice", post(voice_handler))
         .route("/v1/memory/store", post(store_handler))
         .route("/v1/memory/search", post(search_handler))
         .route("/v1/history", get(history_handler))

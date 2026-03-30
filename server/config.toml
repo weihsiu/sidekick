@@ -74,6 +74,12 @@ top_n = 5
 knowledge = 1.5
 faq = 1.2
 
+[stt]
+# Speech-to-text via Groq Whisper (OpenAI-compatible). Remove this section to disable STT.
+api_key_env = "GROQ_API_KEY"
+model = "whisper-large-v3-turbo"
+# base_url = "https://api.groq.com/openai/v1"  # change to use a different provider
+
 [agent]
 # Maximum number of tool call failures before the agent stops retrying.
 max_tool_retries = 5

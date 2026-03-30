@@ -29,7 +29,7 @@ axum-login = "0.18"
 tower-sessions = "0.14"
 oauth2 = "5"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "multipart"] }
 scraper = "0.22"
 dotenvy = "0.15"
 rust-embed = "8.11.0"
@@ -39,3 +39,4 @@ urlencoding = "2"
 base64 = "0.22"
 dashmap = "6"
 tokio-stream = { version = "0.1", features = ["sync"] }
+opencc-rust = { version = "1.1.19", features = ["static-dictionaries"] }

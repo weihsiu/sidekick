@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -8,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use synaptic::core::{MemoryStore, Message};
 use synaptic::graph::{CompiledGraph, MessageState};
 use tokio::sync::broadcast;
+
+use opencc_rust::{DefaultConfig, OpenCC};
 
 use crate::context;
 use crate::memory::UserStorePool;
@@ -20,6 +23,7 @@ const CHANNEL_CAPACITY: usize = 32;
 pub enum UserEvent {
     HumanMessage { id: i64, content: String, timestamp: String },
     AiResponse   { id: i64, content: String, timestamp: String },
+    Error        { message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +68,8 @@ pub struct ChatService {
     tool_failure_count: Arc<AtomicUsize>,
     /// Per-user broadcast channels. Created lazily on first subscribe.
     channels: DashMap<String, broadcast::Sender<UserEvent>>,
+    /// Converts any Simplified Chinese characters in LLM output to Traditional Chinese (Taiwan).
+    opencc: Option<Mutex<OpenCC>>,
 }
 
 impl ChatService {
@@ -73,18 +79,39 @@ impl ChatService {
         system_prompt: String,
         tool_failure_count: Arc<AtomicUsize>,
     ) -> Self {
+        let opencc = match OpenCC::new(DefaultConfig::S2TWP) {
+            Ok(cc) => {
+                tracing::info!("OpenCC S2TWP initialised — Simplified→Traditional safeguard active");
+                Some(Mutex::new(cc))
+            }
+            Err(e) => {
+                tracing::warn!("OpenCC init failed, Traditional Chinese safeguard disabled: {e}");
+                None
+            }
+        };
         Self {
             pool,
             graph,
             system_prompt,
             tool_failure_count,
             channels: DashMap::new(),
+            opencc,
         }
     }
 
     /// Expose the pool so other handlers (store, search, history) can reach it.
     pub fn pool(&self) -> &Arc<UserStorePool> {
         &self.pool
+    }
+
+    /// Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
+    /// No-op for non-Chinese text or when OpenCC is unavailable.
+    pub fn convert(&self, text: &str) -> String {
+        if let Some(ref cc) = self.opencc {
+            cc.lock().unwrap().convert(text)
+        } else {
+            text.to_string()
+        }
     }
 
     /// Subscribe to events for a user. Each caller gets its own receiver.
@@ -96,19 +123,16 @@ impl ChatService {
             .subscribe()
     }
 
-    /// Persist the human message, invoke the LLM, persist the response, and
-    /// broadcast both events to every connected client of this user.
-    pub async fn process_message(
+    /// Persist and broadcast the human message. Returns the timestamp used so
+    /// the caller can pass it to `run_llm` for a consistent conversation timestamp.
+    /// This is intentionally fast (one DB write) so the HTTP handler can return quickly.
+    pub async fn persist_human_message(
         &self,
         user_id: &str,
         message: &str,
-        local_time: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let user_mem = self.pool.get(user_id).await?;
         let now = Utc::now().to_rfc3339();
-
-        // Persist and broadcast the human message immediately so all clients
-        // see it without waiting for the LLM.
         let human_id = user_mem
             .store("conversation", "human", message, &now, 5.0)
             .await?;
@@ -117,6 +141,19 @@ impl ChatService {
             content: message.to_string(),
             timestamp: now.clone(),
         });
+        Ok(now)
+    }
+
+    /// Invoke the LLM and broadcast the AI response. Intended to be called from
+    /// a background task after `persist_human_message` has already returned.
+    pub async fn run_llm(
+        &self,
+        user_id: &str,
+        message: &str,
+        local_time: Option<&str>,
+        now: &str,
+    ) -> Result<()> {
+        let user_mem = self.pool.get(user_id).await?;
 
         // Build message list: system prompt + recent chat window + timestamp + user message.
         let mut messages = vec![Message::system(&self.system_prompt)];
@@ -154,9 +191,17 @@ impl ChatService {
         let (response, importance) = parse_structured_response(&raw);
         tracing::debug!(importance = importance, "chat response importance");
 
+        // Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
+        // No-op for non-Chinese text.
+        let response = if let Some(ref cc) = self.opencc {
+            cc.lock().unwrap().convert(&response)
+        } else {
+            response
+        };
+
         // Persist AI response to SQLite, LanceDB, and the chat window.
         let ai_id = user_mem
-            .store("conversation", "ai", &response, &now, importance)
+            .store("conversation", "ai", &response, now, importance)
             .await?;
         user_mem
             .semantic
@@ -175,7 +220,7 @@ impl ChatService {
         self.broadcast(user_id, UserEvent::AiResponse {
             id: ai_id,
             content: response,
-            timestamp: now,
+            timestamp: now.to_string(),
         });
 
         Ok(())
@@ -184,6 +229,10 @@ impl ChatService {
     /// Remove channels that have no active subscribers.
     pub fn cleanup_channels(&self) {
         self.channels.retain(|_, sender| sender.receiver_count() > 0);
+    }
+
+    pub fn broadcast_error(&self, user_id: &str, message: &str) {
+        self.broadcast(user_id, UserEvent::Error { message: message.to_string() });
     }
 
     fn broadcast(&self, user_id: &str, event: UserEvent) {

@@ -7,5 +7,6 @@ cd "$(dirname "$0")"
 
 export BASE_URL=http://localhost:3000
 export FRONTEND_URL=http://localhost:5173
+export OPENCC_DIR=/opt/homebrew/opt/opencc
 
 cargo run "$@"

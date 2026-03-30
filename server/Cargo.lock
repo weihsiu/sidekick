@@ -3643,6 +3643,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy-static-include"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67f771f5073e25401d245cf2bfca1e43574ecb1128556213f534a15d751763e3"
+dependencies = [
+ "lazy_static",
+ "manifest-dir-macros",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3875,6 +3886,18 @@ name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
+
+[[package]]
+name = "manifest-dir-macros"
+version = "0.1.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c6d40de1ccdbf8bde2eaa0750595478a368f7b3a3f89c426e3454f64e29f593"
+dependencies = [
+ "once_cell",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "markup5ever"
@@ -4273,6 +4296,18 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
+
+[[package]]
+name = "opencc-rust"
+version = "1.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03a70b40c372344205e666303bd9810417bc2ec895e2c608694cc6a04cbc6bfe"
+dependencies = [
+ "lazy-static-include",
+ "lazy_static",
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "openssl-probe"
@@ -5639,6 +5674,7 @@ dependencies = [
  "lru 0.14.0",
  "mime_guess",
  "oauth2",
+ "opencc-rust",
  "reqwest 0.12.28",
  "rust-embed",
  "scraper",

@@ -13,6 +13,7 @@ pub struct AppConfig {
     pub memory: MemoryConfig,
     pub agent: AgentConfig,
     pub rerank: RerankConfig,
+    pub stt: Option<SttConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +117,31 @@ pub struct AgentConfig {
 
 fn default_max_tool_retries() -> usize {
     3
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SttConfig {
+    pub api_key_env: String,
+    #[serde(default = "default_stt_model")]
+    pub model: String,
+    pub base_url: Option<String>,
+}
+
+fn default_stt_model() -> String {
+    "whisper-large-v3-turbo".to_string()
+}
+
+impl SttConfig {
+    pub fn api_key(&self) -> Result<String> {
+        std::env::var(&self.api_key_env).with_context(|| {
+            format!("environment variable '{}' must be set for STT", self.api_key_env)
+        })
+    }
+
+    pub fn endpoint(&self) -> String {
+        let base = self.base_url.as_deref().unwrap_or("https://api.groq.com/openai/v1");
+        format!("{base}/audio/transcriptions")
+    }
 }
 
 #[derive(Debug, Deserialize)]
