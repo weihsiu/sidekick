@@ -3,6 +3,8 @@ pub mod google_calendar;
 pub mod gmail;
 pub mod google_people;
 pub mod google_tasks;
+pub mod find_agents;
 pub mod recall_memory;
 pub mod retry_wrapper;
+pub mod start_coordination;
 pub mod web_search;

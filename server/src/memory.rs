@@ -251,6 +251,10 @@ impl UserStore {
     /// Writes to SQLite first (authoritative). Then embeds the content and
     /// writes the vector to LanceDB. If LanceDB fails the entry is still
     /// persisted in SQLite and FTS — it just won't appear in vector search.
+    ///
+    /// `session_id` links the entry to a coordinator session (`None` for normal
+    /// chat). `source` is `"human"` for ordinary messages and `"coordinator"`
+    /// for agent-to-agent coordination messages.
     pub async fn store(
         &self,
         category: &str,
@@ -258,10 +262,12 @@ impl UserStore {
         content: &str,
         timestamp: &str,
         importance: f32,
+        session_id: Option<&str>,
+        source: &str,
     ) -> Result<i64> {
         let id = self
             .history
-            .append(category, role, content, timestamp, importance)
+            .append(category, role, content, timestamp, importance, session_id, source)
             .await?;
 
         match self.semantic.embeddings.embed_query(content).await {
@@ -307,6 +313,12 @@ impl UserStore {
 
         let vector_ids = vector_ids.unwrap_or_default();
         let fts_ids = fts_ids.unwrap_or_default();
+        tracing::debug!(
+            query,
+            vector_hits = vector_ids.len(),
+            fts_hits = fts_ids.len(),
+            "retrieve: search results"
+        );
 
         if vector_ids.is_empty() && fts_ids.is_empty() {
             return Ok(vec![]);
@@ -407,6 +419,8 @@ impl UserStore {
                 &record.content,
                 &timestamp,
                 record.importance,
+                None,
+                "human",
             )
             .await
             .with_context(|| format!("failed to store entry on line {}", line_num + 1))?;

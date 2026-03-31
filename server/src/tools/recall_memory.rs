@@ -57,13 +57,29 @@ impl Tool for RecallMemory {
             .await
             .map_err(|e| SynapticError::Tool(format!("failed to access memory: {e}")))?;
 
+        tracing::info!(user_id, query, "recall_memory called");
+
         let entries = user_mem
             .retrieve(query, None)
             .await
             .map_err(|e| SynapticError::Tool(format!("memory search failed: {e}")))?;
 
         if entries.is_empty() {
+            tracing::info!(user_id, query, "recall_memory: no entries found");
             return Ok(serde_json::json!("No relevant memories found."));
+        }
+
+        tracing::info!(user_id, query, count = entries.len(), "recall_memory: returning entries");
+        for entry in &entries {
+            tracing::debug!(
+                user_id,
+                id = entry.id,
+                category = %entry.category,
+                role = %entry.role,
+                importance = entry.importance,
+                content = %entry.content,
+                "recall_memory entry"
+            );
         }
 
         Ok(serde_json::json!(format_context(&entries)))

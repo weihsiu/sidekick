@@ -23,7 +23,10 @@ const CHANNEL_CAPACITY: usize = 32;
 pub enum UserEvent {
     HumanMessage { id: i64, content: String, timestamp: String },
     AiResponse   { id: i64, content: String, timestamp: String },
-    Error        { message: String },
+    /// Intermediate coordinator message — filtered out of the user's SSE stream,
+    /// only delivered to the coordinator via /v1/coordinator/events.
+    CoordinatorResponse { id: i64, content: String, timestamp: String, session_id: String },
+    Error { message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -104,7 +107,7 @@ impl ChatService {
         &self.pool
     }
 
-    /// Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
+/// Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
     /// No-op for non-Chinese text or when OpenCC is unavailable.
     pub fn convert(&self, text: &str) -> String {
         if let Some(ref cc) = self.opencc {
@@ -134,7 +137,7 @@ impl ChatService {
         let user_mem = self.pool.get(user_id).await?;
         let now = Utc::now().to_rfc3339();
         let human_id = user_mem
-            .store("conversation", "human", message, &now, 5.0)
+            .store("conversation", "human", message, &now, 5.0, None, "human")
             .await?;
         self.broadcast(user_id, UserEvent::HumanMessage {
             id: human_id,
@@ -172,6 +175,13 @@ impl ChatService {
             ),
         };
         messages.push(Message::system(&time_str));
+        // If the user mentioned an @handle, nudge the LLM to use the coordinate tool.
+        if message.contains('@') {
+            messages.push(Message::system(
+                "The user's message contains an @handle. If they want to contact or coordinate \
+                 with another user's agent, use the `coordinate` tool to fulfill the request.",
+            ));
+        }
         messages.push(Message::human(message));
 
         // Invoke LLM agent.
@@ -201,7 +211,7 @@ impl ChatService {
 
         // Persist AI response to SQLite, LanceDB, and the chat window.
         let ai_id = user_mem
-            .store("conversation", "ai", &response, now, importance)
+            .store("conversation", "ai", &response, now, importance, None, "human")
             .await?;
         user_mem
             .semantic
@@ -222,6 +232,130 @@ impl ChatService {
             content: response,
             timestamp: now.to_string(),
         });
+
+        Ok(())
+    }
+
+    /// Invoke the LLM on behalf of the coordinator and persist/broadcast the result.
+    ///
+    /// - `session_id`: links this exchange to a coordinator session.
+    /// - `is_conclusion`: when `true` the AI response is stored as `source="human"`
+    ///   and broadcast as a normal `AiResponse` so the user sees it in their chat.
+    ///   When `false` both the incoming message and the response are stored as
+    ///   `source="coordinator"` (hidden from the chat view) and broadcast as a
+    ///   `CoordinatorResponse` so the coordinator can receive it via SSE.
+    pub async fn run_llm_coordinator(
+        &self,
+        user_id: &str,
+        message: &str,
+        session_id: &str,
+        is_conclusion: bool,
+        is_agent_coordination: bool,
+        initiator_name: &str,
+        now: &str,
+    ) -> Result<()> {
+        let user_mem = self.pool.get(user_id).await?;
+
+        let mut messages = vec![Message::system(&self.system_prompt)];
+        let history = user_mem
+            .semantic
+            .chat_memory
+            .load(user_id)
+            .await
+            .context("failed to load chat history")?;
+        messages.extend(history);
+        messages.push(Message::system(&format!(
+            "Current date and time (UTC): {}",
+            Utc::now().format("%A, %B %-d, %Y %H:%M UTC")
+        )));
+        if is_conclusion {
+            messages.push(Message::system(
+                "A multi-agent coordination session you initiated has just concluded. \
+                 The conclusion below was reached by coordinating with the relevant agents. \
+                 Relay it to the user as a direct, natural answer to their original request — \
+                 do not mention the coordination session or internal process.",
+            ));
+        } else if is_agent_coordination {
+            let coordinator_context = format!(
+                "You are being contacted by a coordinator agent acting on behalf of {}. \
+                 This is an agent-to-agent coordination session — you are serving the coordinator, \
+                 not a human directly. Respond with your user's relevant context, preferences, or \
+                 any information that helps fulfill the request being made on {}'s behalf. \
+                 Do not start new coordination sessions.",
+                initiator_name, initiator_name
+            );
+            messages.push(Message::system(&coordinator_context));
+        } else {
+            messages.push(Message::system(
+                "You are participating in a coordination session. \
+                 Respond with your user's relevant context, preferences, or availability. \
+                 Do not start new coordination sessions.",
+            ));
+        }
+        messages.push(Message::human(message));
+
+        let msg_state = MessageState { messages };
+        self.tool_failure_count.store(0, Ordering::SeqCst);
+        let result = context::CURRENT_USER_ID
+            .scope(user_id.to_string(), self.graph.invoke(msg_state))
+            .await
+            .context("coordinator LLM invocation failed")?;
+
+        let raw = result
+            .state()
+            .last_message()
+            .map(|m: &Message| m.content().to_string())
+            .unwrap_or_default();
+
+        let (response, importance) = parse_structured_response(&raw);
+
+        let response = if let Some(ref cc) = self.opencc {
+            cc.lock().unwrap().convert(&response)
+        } else {
+            response
+        };
+
+        // Store the incoming coordinator message (always hidden).
+        user_mem
+            .store("conversation", "coordinator", message, now, 5.0, Some(session_id), "coordinator")
+            .await?;
+
+        // Store the AI response — hidden for intermediate rounds, visible for conclusion.
+        let source = if is_conclusion { "human" } else { "coordinator" };
+        let ai_id = user_mem
+            .store("conversation", "ai", &response, now, importance, Some(session_id), source)
+            .await?;
+
+        // Update the short-term chat window so the agent retains coordination context.
+        user_mem
+            .semantic
+            .chat_memory
+            .append(user_id, Message::human(message))
+            .await
+            .context("failed to append coordinator message to chat window")?;
+        user_mem
+            .semantic
+            .chat_memory
+            .append(user_id, Message::ai(&response))
+            .await
+            .context("failed to append coordinator response to chat window")?;
+
+        if is_conclusion {
+            // Relay conclusion to user via the normal chat SSE stream.
+            self.broadcast(user_id, UserEvent::AiResponse {
+                id: ai_id,
+                content: response,
+                timestamp: now.to_string(),
+            });
+        } else {
+            // Send only to coordinator via the coordinator SSE stream.
+            self.broadcast(user_id, UserEvent::CoordinatorResponse {
+                id: ai_id,
+                content: response,
+                timestamp: now.to_string(),
+                session_id: session_id.to_string(),
+            });
+        }
 
         Ok(())
     }

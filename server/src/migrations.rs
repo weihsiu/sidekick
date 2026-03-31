@@ -71,6 +71,41 @@ pub async fn run_sqlite_migrations(db: &SqlitePool) -> Result<()> {
         tx.commit().await.context("v1: failed to commit migration")?;
     }
 
+    if version < 2 {
+        // v2: Add session_id and source to memory; add agent_url to contacts.
+        //
+        // session_id links all messages within a coordinator session together.
+        // source distinguishes human-originated messages from coordinator ones.
+        // agent_url stores the remote endpoint for a contact's sidekick agent.
+        let mut tx = db.begin().await.context("v2: failed to begin transaction")?;
+
+        sqlx::query("ALTER TABLE memory ADD COLUMN session_id TEXT")
+            .execute(&mut *tx)
+            .await
+            .context("v2: failed to add session_id to memory")?;
+
+        sqlx::query(
+            "ALTER TABLE memory ADD COLUMN source TEXT NOT NULL DEFAULT 'human'",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("v2: failed to add source to memory")?;
+
+        sqlx::query(
+            "ALTER TABLE contacts ADD COLUMN agent_url TEXT NOT NULL DEFAULT 'http://localhost:3000'",
+        )
+        .execute(&mut *tx)
+        .await
+        .context("v2: failed to add agent_url to contacts")?;
+
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&mut *tx)
+            .await
+            .context("v2: failed to set schema version")?;
+
+        tx.commit().await.context("v2: failed to commit migration")?;
+    }
+
     // To add a future migration: add an `if version < N { ... }` block here
     // and set `PRAGMA user_version = N` at the end of it. The current SQLite
     // version is whatever the highest N is across all blocks.

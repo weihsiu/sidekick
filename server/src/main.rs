@@ -2,6 +2,7 @@ mod auth;
 mod chat_service;
 mod config;
 mod context;
+mod coordinator;
 mod embeddings;
 mod error;
 mod history;
@@ -20,8 +21,8 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use anyhow::Context;
-use axum::extract::State;
-use axum::http::{header, StatusCode, Uri};
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -106,6 +107,7 @@ struct AppState {
     chat_service: Arc<ChatService>,
     cookie_key: CookieKey,
     stt: Option<Arc<SttClient>>,
+    coordinator_secret: Option<String>,
 }
 
 impl axum::extract::FromRef<Arc<AppState>> for CookieKey {
@@ -170,6 +172,24 @@ struct HistoryQuery {
     category: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct CoordinatorMessageRequest {
+    user_id: String,
+    session_id: String,
+    content: String,
+    #[serde(default)]
+    is_conclusion: bool,
+    /// "agent_coordination" when the sender is another agent acting as orchestrator.
+    session_type: String,
+    /// Display name of the initiating user on whose behalf the coordinator is acting.
+    initiator_name: String,
+}
+
+#[derive(Deserialize)]
+struct CoordinatorEventsQuery {
+    session_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -186,6 +206,10 @@ async fn sse_handler(
 
     let stream = BroadcastStream::new(rx).filter_map(|result| async move {
         let ev = result.ok()?;
+        // Coordinator messages are not shown in the user's chat view.
+        if matches!(ev, chat_service::UserEvent::CoordinatorResponse { .. }) {
+            return None;
+        }
         let data = serde_json::to_string(&ev).ok()?;
         Some(Ok::<Event, Infallible>(Event::default().data(data)))
     });
@@ -278,6 +302,92 @@ async fn voice_handler(
     Ok(StatusCode::ACCEPTED)
 }
 
+// ---------------------------------------------------------------------------
+// Coordinator endpoints (server-to-server, Bearer-token auth)
+// ---------------------------------------------------------------------------
+
+fn verify_coordinator_auth(
+    headers: &HeaderMap,
+    secret: &Option<String>,
+) -> Result<(), ApiError> {
+    let expected = secret
+        .as_deref()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("coordinator_secret not configured")))?;
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+    if provided != expected {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Receive a coordinator message, run the agent's LLM on it, and broadcast
+/// the response. Used by `CoordinatorSession` on remote (or same-host) agents.
+async fn coordinator_message_handler(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CoordinatorMessageRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    verify_coordinator_auth(&headers, &state.coordinator_secret)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let chat_service = Arc::clone(&state.chat_service);
+    let user_id = req.user_id.clone();
+    let message = req.content.clone();
+    let session_id = req.session_id.clone();
+    let is_conclusion = req.is_conclusion;
+    let is_agent_coordination = req.session_type == "agent_coordination";
+    let initiator_name = req.initiator_name.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = chat_service
+            .run_llm_coordinator(&user_id, &message, &session_id, is_conclusion, is_agent_coordination, &initiator_name, &now)
+            .await
+        {
+            tracing::error!("coordinator LLM failed for {user_id}: {e:#}");
+            // Do not broadcast errors to the user — coordinator failures are
+            // handled internally (marked as unavailable and the session continues).
+        }
+    });
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// SSE stream for the coordinator — delivers only `CoordinatorResponse` events
+/// matching the requested `session_id`. Not exposed to regular users.
+async fn coordinator_events_handler(
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    Query(params): Query<CoordinatorEventsQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    verify_coordinator_auth(&headers, &state.coordinator_secret)?;
+
+    let session_id = params.session_id.clone();
+    let rx = state.chat_service.subscribe(&user_id);
+
+    let stream = BroadcastStream::new(rx).filter_map(move |result| {
+        let sid = session_id.clone();
+        async move {
+            let ev = result.ok()?;
+            match &ev {
+                chat_service::UserEvent::CoordinatorResponse { session_id: ev_sid, .. }
+                    if ev_sid == &sid =>
+                {
+                    let data = serde_json::to_string(&ev).ok()?;
+                    Some(Ok::<Event, Infallible>(Event::default().data(data)))
+                }
+                _ => None,
+            }
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(25))))
+}
+
 async fn store_handler(
     mut auth_session: AuthSession<AuthBackend>,
     jar: Jar,
@@ -287,7 +397,7 @@ async fn store_handler(
     let user = require_user(&mut auth_session, &jar).await?;
     let user_mem = state.chat_service.pool().get(&user.id).await?;
     let now = chrono::Utc::now().to_rfc3339();
-    user_mem.store(&req.category, &req.role, &req.content, &now, req.importance).await?;
+    user_mem.store(&req.category, &req.role, &req.content, &now, req.importance, None, "human").await?;
 
     Ok(Json(MessageResponse {
         message: "stored".to_string(),
@@ -341,14 +451,14 @@ async fn history_handler(
 
         let name_fact = format!("The user's name is {}.", display_name);
         let now = chrono::Utc::now().to_rfc3339();
-        user_mem.store("knowledge", "system", &name_fact, &now, 10.0).await?;
+        user_mem.store("knowledge", "system", &name_fact, &now, 10.0, None, "human").await?;
 
         let welcome = format!(
             "Welcome to Sidekick, {}! I'm your AI assistant with long-term memory. How can I help you today?",
             first_name
         );
         // Welcome message goes to history only — not worth embedding.
-        user_mem.history.append("conversation", "ai", &welcome, &now, 1.0).await?;
+        user_mem.history.append("conversation", "ai", &welcome, &now, 1.0, None, "human").await?;
         user_mem
             .semantic
             .chat_memory
@@ -360,9 +470,9 @@ async fn history_handler(
     let limit = params.limit.unwrap_or(20).min(100);
     let category = params.category.as_deref();
     let entries = if let Some(after) = params.after {
-        user_mem.history.fetch_after(after, limit, category).await?
+        user_mem.history.fetch_after(after, limit, category, true).await?
     } else {
-        user_mem.history.fetch(params.before, limit, category).await?
+        user_mem.history.fetch(params.before, limit, category, true).await?
     };
     Ok(Json(entries))
 }
@@ -482,6 +592,14 @@ async fn main() -> anyhow::Result<()> {
     let mut all_tools: Vec<Arc<dyn synaptic::core::Tool>> = vec![
         tools::recall_memory::RecallMemory::new(pool.clone()),
         Arc::new(tools::web_search::WebSearch::new()),
+        tools::find_agents::FindAgents::new(Arc::new(db.clone())),
+        tools::start_coordination::Coordinate::new(
+            Arc::new(db.clone()),
+            pool.clone(),
+            Arc::new(cfg.llm.clone()),
+            cfg.agent.coordinator_secret.clone(),
+            cfg.server.base_url.clone(),
+        ),
     ];
     if let Some(google_config) = cfg.auth.providers.get("google") {
         let api = tools::google_api::GoogleApiClient::new(pool.clone(), google_config)?;
@@ -540,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
         chat_service,
         cookie_key: CookieKey(cookie_key),
         stt,
+        coordinator_secret: cfg.agent.coordinator_secret.clone(),
     });
 
     // --- Routes ---
@@ -550,6 +669,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/memory/store", post(store_handler))
         .route("/v1/memory/search", post(search_handler))
         .route("/v1/history", get(history_handler))
+        .route("/v1/coordinator/message", post(coordinator_message_handler))
+        .route("/v1/coordinator/events/{user_id}", get(coordinator_events_handler))
         .with_state(state.clone());
 
     let auth_routes = Router::new()

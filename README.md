@@ -7,7 +7,7 @@ Sidekick has a Rust backend and a React frontend, packaged as a PWA:
 - **`server/`** — Axum HTTP server with OAuth2 authentication, per-user dual-store memory (LanceDB for semantic search + SQLite for browsable history), short-term chat window, and SSE push for real-time multi-client sync. The client is embedded into the server binary via `rust-embed`, producing a single self-contained executable.
 - **`client/`** — React + Vite PWA with OAuth login, chat UI, infinite scroll conversation history, and real-time sync across browser tabs and devices via SSE
 
-Each user gets their own LanceDB database for semantic search and a SQLite database for ordered history, both managed under a single LRU pool for file descriptor efficiency. Past entries are retrieved via hybrid search (dense vector + full-text keyword matching with Reciprocal Rank Fusion) and injected as context on every turn, giving the agent long-term memory per user.
+Each user gets their own LanceDB database for semantic search and a SQLite database for ordered history, both managed under a single LRU pool for file descriptor efficiency. Long-term memory is retrieved on demand via the `recall_memory` tool — the agent calls it when it needs past context. Retrieval uses hybrid search (dense vector + full-text keyword matching with Reciprocal Rank Fusion).
 
 Entries are categorized (e.g. `conversation`, `knowledge`) so you can batch-import structured knowledge alongside organic chat history. All writes go to both stores — LanceDB for semantic retrieval, SQLite for chronological browsing.
 
@@ -121,12 +121,24 @@ Both are managed under a single LRU pool so they are opened and evicted together
 
 Categories not listed default to `1.0`.
 
+### `[stt]` — Speech-to-text (optional)
+
+Remove this section to disable voice input entirely.
+
+| Field | Description |
+|-------|-------------|
+| `api_key_env` | Environment variable holding the API key (Groq or any OpenAI-compatible STT provider) |
+| `model` | Whisper model name (e.g. `"whisper-large-v3-turbo"`) |
+| `base_url` | *(optional)* Override the STT endpoint |
+
 ### `[agent]` — System prompt and tools
 
 | Field | Description |
 |-------|-------------|
-| `system_prompt` | Base system prompt defining the agent's persona and behavior. RAG context is appended automatically. |
+| `system_prompt` | Base system prompt defining the agent's persona and behavior. |
 | `max_tool_retries` | *(optional, default `3`)* Max tool call failures before the agent stops retrying for that conversation turn. |
+| `coordinator_secret` | *(optional)* Shared secret for server-to-server coordinator authentication. Set the same value via `COORDINATOR_SECRET` env var on all instances that should be able to coordinate with each other. |
+| `coordinator_max_rounds` | *(optional, default `10`)* Max coordinator loop iterations before forcing a conclusion. |
 
 ### Example configurations
 
@@ -250,6 +262,8 @@ Before running, you need OAuth credentials from at least one provider.
 | `GOOGLE_CLIENT_SECRET` | if using Google OAuth | OAuth client secret for Google |
 | `FACEBOOK_CLIENT_SECRET` | if using Facebook OAuth | OAuth client secret for Facebook |
 | `SESSION_SECRET` | no | Encryption key for the "remember me" cookie. If not set, a random key is generated on each startup (cookies won't survive restarts). Use a stable, long random string in production. |
+| `COORDINATOR_SECRET` | no | Shared secret for server-to-server coordinator auth. Required to enable multi-agent coordination. Must match on all coordinating instances. |
+| `GROQ_API_KEY` | if using STT | API key for Groq Whisper (or any OpenAI-compatible STT provider) |
 | `SIDEKICK_CONFIG` | no | Path to the config file (overrides default resolution) |
 | `RUST_LOG` | no | Log level filter (e.g. `sidekick_server=debug`) |
 
@@ -321,13 +335,22 @@ The client should open this connection before sending any messages. The stream i
 
 ### `POST /v1/chat`
 
-Submit a message. Returns `200 OK` with no body. The human message and AI response are delivered asynchronously to all connected clients via `GET /v1/events`.
+Submit a message. Returns `202 Accepted` with no body. The human message and AI response are delivered asynchronously to all connected clients via `GET /v1/events`.
 
 ```json
 {
-  "message": "What did we talk about yesterday?"
+  "message": "What did we talk about yesterday?",
+  "local_time": "Tuesday, April 1, 2026 09:00 JST"
 }
 ```
+
+`local_time` is optional. If provided it is injected into the system context so the agent knows the user's local time and timezone.
+
+### `POST /v1/voice`
+
+Submit a voice message as raw audio bytes. The server transcribes it (via Whisper), persists the transcript as a human message, and kicks off LLM processing — all in one request. Returns `202 Accepted`, or `204 No Content` if the transcript is empty.
+
+Set `Content-Type` to the audio format (e.g. `audio/webm`, `audio/mp4`). Requires STT to be configured in `[stt]`.
 
 ### `POST /v1/memory/store`
 
@@ -399,6 +422,15 @@ Response:
 ```
 
 To paginate, pass the smallest `id` from the current page as the `before` parameter in the next request.
+
+### Coordinator endpoints (server-to-server)
+
+These endpoints use Bearer token auth (`Authorization: Bearer <coordinator_secret>`) instead of session cookies. They are used internally by the coordinator agent and are not intended for direct client use.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/coordinator/message` | Deliver a coordinator message to an agent and trigger LLM processing |
+| `GET` | `/v1/coordinator/events/{user_id}` | SSE stream delivering `coordinator_response` events for a given `session_id` |
 
 ## Batch import
 
@@ -498,8 +530,12 @@ The `server/flyio/fly.toml` configures:
 - **Chat window**: Short-term context via Synaptic's `ConversationWindowMemory` for recent conversational continuity
 - **Hybrid retrieval**: Dense vector cosine similarity + full-text keyword matching, fused with Reciprocal Rank Fusion (RRF)
 - **Reranking**: Retrieved results are reranked with configurable category weight boosts
+- **Tool-based long-term memory**: The agent calls `recall_memory` on demand rather than pre-injecting RAG context. This avoids bloating every prompt — the agent retrieves only when it actually needs past context.
+- **Multi-agent coordination**: When the user mentions an @handle or asks to coordinate with someone, the agent calls `start_coordination_session`. This spawns a `CoordinatorAgent` in a background task, which uses its own LLM loop to find agents via `find_agents`, send messages to them via `/v1/coordinator/message`, await their responses via SSE, and deliver a synthesised conclusion back to the initiating user. Coordinator agents identify themselves explicitly in messages to other agents, and receiving agents are told via their system prompt that they are serving a coordinator acting on behalf of a named user.
+- **Voice input**: `POST /v1/voice` accepts raw audio, transcribes it via Whisper (Groq or any OpenAI-compatible endpoint), and processes it identically to a typed message. Requires `[stt]` in config.
 - **Structured LLM responses**: The agent returns structured JSON with an `importance` score (1–10). High-importance responses are written to long-term memory; low-importance ones are skipped, reducing noise in the memory stores.
 - **Agent tools**: The agent can call tools to act on the user's behalf. Tools read the current user ID from a task-local context set per request, so tool calls in concurrent requests are always isolated to the correct user.
+- **Traditional Chinese output**: LLM responses are passed through OpenCC (S2TWP) to convert any Simplified Chinese characters to Traditional Chinese (Taiwan). No-op for non-Chinese text.
 - **PWA**: Installable progressive web app with service worker caching for offline static assets. Links in chat messages open in the system browser.
 
 ## How it works
@@ -510,29 +546,27 @@ The `server/flyio/fly.toml` configures:
 4. Client sends a `POST /v1/chat` with a `message`
 5. Server saves the human message to SQLite and immediately broadcasts a `human_message` event to all connected clients for that user
 6. The user's databases are opened from the pool (or created on first use)
-7. The message is embedded and used to search the user's LanceDB via hybrid search (long-term semantic memory)
-8. The configurable system prompt + retrieved RAG context are injected as a system message
-9. The recent chat window (last N messages) is included as message history for conversational continuity
-10. The LLM generates a response with both long-term and short-term context
-11. Both the user message and the assistant response are stored in LanceDB (semantic) and SQLite (history), plus the chat window (short-term)
-12. Server broadcasts an `ai_response` event — all connected clients display the response simultaneously
+7. The system prompt + recent chat window (last N messages) are assembled as the message history
+8. The LLM generates a response, calling tools as needed:
+   - `recall_memory` to search long-term memory on demand
+   - Google tools to read calendar, mail, tasks, and contacts
+   - `web_search` for current information
+   - `find_agents` + `start_coordination_session` to coordinate with other users' agents
+9. Both the user message and the assistant response are stored in LanceDB (semantic) and SQLite (history), plus the chat window (short-term)
+10. Server broadcasts an `ai_response` event — all connected clients display the response simultaneously
 
 ## Data stores
 
 ### LanceDB (semantic memory)
 
-Each entry in a user's LanceDB has the following columns:
+LanceDB stores only what is needed for retrieval. The authoritative text lives in SQLite; the `id` column is the SQLite primary key used to join back to content after a vector search.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `id` | string | UUID |
+| `id` | string | SQLite primary key of the corresponding history entry |
 | `category` | string | Entry category (`conversation`, `knowledge`, etc.) |
-| `role` | string | `human`, `ai`, or `system` |
-| `content` | string | Text content |
-| `timestamp` | string | ISO 8601 timestamp |
+| `importance` | float32 | Importance weight 1–10, used to boost retrieval scores |
 | `vector` | float32[] | Dense embedding vector |
-
-A full-text search index on `content` is maintained automatically for hybrid retrieval.
 
 ### SQLite (memory history)
 
@@ -552,8 +586,10 @@ The agent has access to the following tools:
 
 | Tool | Description |
 |------|-------------|
-| `recall_memory` | Semantic search over the user's long-term memory |
+| `recall_memory` | Semantic search over the user's long-term memory. Called on demand when the agent needs past context. |
 | `web_search` | Search the web via DuckDuckGo — no API key required |
+| `find_agents` | Search the server directory for other users' agents by name or @handle |
+| `start_coordination_session` | Start a multi-agent coordination session. Spawns a coordinator agent that messages other agents on the user's behalf and delivers a synthesised conclusion back to the user. |
 | `gmail` | Search and read messages, send email, modify labels |
 | `google_calendar` | List, create, update, and delete calendar events; check availability |
 | `google_tasks` | Manage task lists and individual tasks |
@@ -569,16 +605,20 @@ All tools are wrapped with a retry layer that retries on transient failures. The
 server/
   Cargo.toml              # sidekick-server package
   config.toml             # Runtime configuration
+  dev.sh                  # Local dev launcher (sets OPENCC_DIR, BASE_URL, FRONTEND_URL)
   src/
     main.rs               # HTTP server, API handlers, --import CLI
     chat_service.rs       # ChatService: message processing, LLM invocation, SSE broadcast
+    coordinator.rs        # CoordinatorAgent: multi-agent coordination loop + tools
     config.rs             # Config file parsing
     context.rs            # Task-local CURRENT_USER_ID for per-user tool isolation
     error.rs              # API error types (thiserror + anyhow)
+    migrations.rs         # SQLite and LanceDB schema versioning
     provider.rs           # Builds the ChatModel from config
     embeddings.rs         # Builds the Embeddings model from config
     rerank.rs             # Reranker trait and mock implementation
-    memory.rs             # Per-user memory: SemanticMemory (LanceDB), UserMemory bundle, pool
+    stt.rs                # Speech-to-text client (Whisper / OpenAI-compatible)
+    memory.rs             # Per-user memory: SemanticMemory (LanceDB), UserStore bundle, pool
     history.rs            # Per-user memory history: MemoryHistory (SQLite), cursor pagination
     user.rs               # User model (SQLite), AuthUser impl
     auth/
@@ -595,6 +635,8 @@ server/
       google_people.rs    # Google Contacts tool
       recall_memory.rs    # Semantic memory recall tool
       web_search.rs       # Web search via DuckDuckGo (no API key required)
+      find_agents.rs      # Directory search tool (used by coordinator and user agent)
+      start_coordination.rs  # Coordination session launcher tool
       retry_wrapper.rs    # Retry wrapper for transient failures
 client/
   package.json            # React + Vite PWA frontend

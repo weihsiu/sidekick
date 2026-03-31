@@ -15,6 +15,12 @@ pub struct HistoryEntry {
     pub content: String,
     pub timestamp: String,
     pub importance: f32,
+    /// Links all messages belonging to the same coordinator session.
+    /// `None` for ordinary human/agent messages.
+    pub session_id: Option<String>,
+    /// Message origin: `"human"` for normal chat, `"coordinator"` for
+    /// agent-to-agent coordination messages.
+    pub source: String,
 }
 
 /// Per-user memory history backed by SQLite.
@@ -99,6 +105,10 @@ impl MemoryHistory {
     }
 
     /// Append an entry to the memory history and update the FTS index.
+    ///
+    /// `session_id` links this entry to a coordinator session; pass `None` for
+    /// ordinary human/agent messages. `source` should be `"human"` for normal
+    /// chat and `"coordinator"` for agent-to-agent coordination messages.
     pub async fn append(
         &self,
         category: &str,
@@ -106,16 +116,20 @@ impl MemoryHistory {
         content: &str,
         timestamp: &str,
         importance: f32,
+        session_id: Option<&str>,
+        source: &str,
     ) -> Result<i64> {
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO memory (category, role, content, timestamp, importance)
-             VALUES (?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO memory (category, role, content, timestamp, importance, session_id, source)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(category)
         .bind(role)
         .bind(content)
         .bind(timestamp)
         .bind(importance)
+        .bind(session_id)
+        .bind(source)
         .fetch_one(&self.db)
         .await
         .context("failed to insert memory history entry")?;
@@ -172,31 +186,34 @@ impl MemoryHistory {
         }
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT id, category, role, content, timestamp, importance
+            "SELECT id, category, role, content, timestamp, importance, session_id, source
              FROM memory WHERE id IN ({placeholders})",
         );
-        let mut q = sqlx::query_as::<_, (i64, String, String, String, String, f32)>(&sql);
+        let mut q = sqlx::query_as::<_, (i64, String, String, String, String, f32, Option<String>, String)>(&sql);
         for id in ids {
             q = q.bind(*id);
         }
         let rows = q.fetch_all(&self.db).await.context("failed to fetch entries by id")?;
         Ok(rows
             .into_iter()
-            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+            .map(|(id, category, role, content, timestamp, importance, session_id, source)| HistoryEntry {
                 id,
                 category,
                 role,
                 content,
                 timestamp,
                 importance,
+                session_id,
+                source,
             })
             .collect())
     }
 
     /// Fetch every row in the memory table, ordered by id ascending.
     pub async fn fetch_all(&self) -> Result<Vec<HistoryEntry>> {
-        let rows: Vec<(i64, String, String, String, String, f32)> = sqlx::query_as(
-            "SELECT id, category, role, content, timestamp, importance FROM memory ORDER BY id ASC",
+        let rows: Vec<(i64, String, String, String, String, f32, Option<String>, String)> = sqlx::query_as(
+            "SELECT id, category, role, content, timestamp, importance, session_id, source
+             FROM memory ORDER BY id ASC",
         )
         .fetch_all(&self.db)
         .await
@@ -204,13 +221,15 @@ impl MemoryHistory {
 
         Ok(rows
             .into_iter()
-            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+            .map(|(id, category, role, content, timestamp, importance, session_id, source)| HistoryEntry {
                 id,
                 category,
                 role,
                 content,
                 timestamp,
                 importance,
+                session_id,
+                source,
             })
             .collect())
     }
@@ -230,6 +249,8 @@ impl MemoryHistory {
     ///   to start from the latest.
     /// - `limit`: max number of entries to return.
     /// - `category`: optional filter (e.g. `"conversation"`).
+    /// - `hide_coordinator`: when `true`, excludes coordinator session messages
+    ///   (`source = 'coordinator'`). Pass `true` for the normal chat view.
     ///
     /// Returns entries in **ascending** order (oldest first within the page)
     /// so the client can prepend them directly.
@@ -238,59 +259,41 @@ impl MemoryHistory {
         before: Option<i64>,
         limit: i64,
         category: Option<&str>,
+        hide_coordinator: bool,
     ) -> Result<Vec<HistoryEntry>> {
-        let rows: Vec<(i64, String, String, String, String, f32)> = match (before, category) {
+        let coord_clause = if hide_coordinator { " AND source != 'coordinator'" } else { "" };
+        let select = "SELECT id, category, role, content, timestamp, importance, session_id, source FROM memory";
+
+        let rows: Vec<(i64, String, String, String, String, f32, Option<String>, String)> = match (before, category) {
             (Some(cursor), Some(cat)) => {
-                sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp, importance FROM memory
-                     WHERE id < ? AND category = ? ORDER BY id DESC LIMIT ?",
-                )
-                .bind(cursor)
-                .bind(cat)
-                .bind(limit)
-                .fetch_all(&self.db)
-                .await?
+                let sql = format!("{select} WHERE id < ? AND category = ?{coord_clause} ORDER BY id DESC LIMIT ?");
+                sqlx::query_as(&sql).bind(cursor).bind(cat).bind(limit).fetch_all(&self.db).await?
             }
             (Some(cursor), None) => {
-                sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp, importance FROM memory
-                     WHERE id < ? ORDER BY id DESC LIMIT ?",
-                )
-                .bind(cursor)
-                .bind(limit)
-                .fetch_all(&self.db)
-                .await?
+                let sql = format!("{select} WHERE id < ?{coord_clause} ORDER BY id DESC LIMIT ?");
+                sqlx::query_as(&sql).bind(cursor).bind(limit).fetch_all(&self.db).await?
             }
             (None, Some(cat)) => {
-                sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp, importance FROM memory
-                     WHERE category = ? ORDER BY id DESC LIMIT ?",
-                )
-                .bind(cat)
-                .bind(limit)
-                .fetch_all(&self.db)
-                .await?
+                let sql = format!("{select} WHERE category = ?{coord_clause} ORDER BY id DESC LIMIT ?");
+                sqlx::query_as(&sql).bind(cat).bind(limit).fetch_all(&self.db).await?
             }
             (None, None) => {
-                sqlx::query_as(
-                    "SELECT id, category, role, content, timestamp, importance FROM memory
-                     ORDER BY id DESC LIMIT ?",
-                )
-                .bind(limit)
-                .fetch_all(&self.db)
-                .await?
+                let sql = format!("{select} WHERE 1=1{coord_clause} ORDER BY id DESC LIMIT ?");
+                sqlx::query_as(&sql).bind(limit).fetch_all(&self.db).await?
             }
         };
 
         let mut entries: Vec<HistoryEntry> = rows
             .into_iter()
-            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+            .map(|(id, category, role, content, timestamp, importance, session_id, source)| HistoryEntry {
                 id,
                 category,
                 role,
                 content,
                 timestamp,
                 importance,
+                session_id,
+                source,
             })
             .collect();
         entries.reverse();
@@ -301,41 +304,39 @@ impl MemoryHistory {
     /// Fetch entries newer than a cursor, for catch-up after reconnect.
     ///
     /// Returns entries in **ascending** order (oldest first).
+    /// `hide_coordinator`: when `true`, excludes coordinator session messages.
     pub async fn fetch_after(
         &self,
         after: i64,
         limit: i64,
         category: Option<&str>,
+        hide_coordinator: bool,
     ) -> Result<Vec<HistoryEntry>> {
-        let rows: Vec<(i64, String, String, String, String, f32)> = match category {
-            Some(cat) => sqlx::query_as(
-                "SELECT id, category, role, content, timestamp, importance FROM memory
-                 WHERE id > ? AND category = ? ORDER BY id ASC LIMIT ?",
-            )
-            .bind(after)
-            .bind(cat)
-            .bind(limit)
-            .fetch_all(&self.db)
-            .await?,
-            None => sqlx::query_as(
-                "SELECT id, category, role, content, timestamp, importance FROM memory
-                 WHERE id > ? ORDER BY id ASC LIMIT ?",
-            )
-            .bind(after)
-            .bind(limit)
-            .fetch_all(&self.db)
-            .await?,
+        let coord_clause = if hide_coordinator { " AND source != 'coordinator'" } else { "" };
+        let select = "SELECT id, category, role, content, timestamp, importance, session_id, source FROM memory";
+
+        let rows: Vec<(i64, String, String, String, String, f32, Option<String>, String)> = match category {
+            Some(cat) => {
+                let sql = format!("{select} WHERE id > ? AND category = ?{coord_clause} ORDER BY id ASC LIMIT ?");
+                sqlx::query_as(&sql).bind(after).bind(cat).bind(limit).fetch_all(&self.db).await?
+            }
+            None => {
+                let sql = format!("{select} WHERE id > ?{coord_clause} ORDER BY id ASC LIMIT ?");
+                sqlx::query_as(&sql).bind(after).bind(limit).fetch_all(&self.db).await?
+            }
         };
 
         Ok(rows
             .into_iter()
-            .map(|(id, category, role, content, timestamp, importance)| HistoryEntry {
+            .map(|(id, category, role, content, timestamp, importance, session_id, source)| HistoryEntry {
                 id,
                 category,
                 role,
                 content,
                 timestamp,
                 importance,
+                session_id,
+                source,
             })
             .collect())
     }

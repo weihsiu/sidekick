@@ -74,7 +74,7 @@ impl OAuthProviderConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
     pub provider: String,
     pub model: String,
@@ -113,6 +113,11 @@ pub struct AgentConfig {
     /// for that conversation turn. Defaults to 3.
     #[serde(default = "default_max_tool_retries")]
     pub max_tool_retries: usize,
+    /// Shared secret for server-to-server coordinator authentication.
+    /// Set the same value on all Sidekick instances that should be able to
+    /// coordinate with each other. Required to use multi-agent coordination.
+    #[serde(default)]
+    pub coordinator_secret: Option<String>,
 }
 
 fn default_max_tool_retries() -> usize {
@@ -187,6 +192,9 @@ pub fn load(path: &Path) -> Result<AppConfig> {
     }
     if let Ok(val) = std::env::var("FRONTEND_URL") {
         cfg.server.frontend_url = Some(val);
+    }
+    if let Ok(val) = std::env::var("COORDINATOR_SECRET") {
+        cfg.agent.coordinator_secret = Some(val);
     }
 
     Ok(cfg)
