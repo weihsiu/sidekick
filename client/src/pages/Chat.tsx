@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAuth } from "../auth";
@@ -75,7 +75,6 @@ export function ChatPage() {
 
       setMessages((prev) => [...older, ...prev]);
 
-      // Preserve scroll position when prepending older messages.
       if (before !== undefined && container) {
         requestAnimationFrame(() => {
           container.scrollTop = container.scrollHeight - prevScrollHeight;
@@ -111,8 +110,13 @@ export function ChatPage() {
       fetch(`/v1/history?after=${after}&category=conversation`)
         .then((r) => (r.ok ? r.json() : []))
         .then((missed: Message[]) => {
-          if (missed.length > 0) setMessages((prev) => [...prev, ...missed]);
-        });
+          if (missed.length > 0) setMessages((prev) => {
+            const existingIds = new Set(prev.map((m) => m.id).filter((id) => id !== undefined));
+            const newMessages = missed.filter((m) => m.id === undefined || !existingIds.has(m.id));
+            return newMessages.length > 0 ? [...prev, ...newMessages] : prev;
+          });
+        })
+        .catch((err) => console.error("Failed to fetch missed messages on reconnect:", err));
     };
 
     es.onmessage = (e) => {
@@ -124,6 +128,7 @@ export function ChatPage() {
         timestamp?: string;
       };
       if (event.type === "human_message") {
+        if (event.id !== undefined) lastMessageIdRef.current = event.id;
         setMessages((prev) => {
           // Replace the optimistic pending message if one exists, otherwise append.
           const idx = prev.findLastIndex((m: Message) => m.role === "human" && m.pending);
@@ -137,6 +142,7 @@ export function ChatPage() {
         });
         setTyping(true);
       } else if (event.type === "ai_response") {
+        if (event.id !== undefined) lastMessageIdRef.current = event.id;
         setMessages((prev) => [
           ...prev,
           { id: event.id, role: "ai", content: event.content!, timestamp: event.timestamp },
@@ -166,23 +172,35 @@ export function ChatPage() {
   useEffect(() => {
     if (initialLoadDone.current) return;
     initialLoadDone.current = true;
-    loadHistory().then(() => {
-      // Scroll to bottom after initial load and sync scroll tracking.
-      requestAnimationFrame(() => {
-        messagesEndRef.current?.scrollIntoView();
-      });
-    });
+    loadHistory();
   }, [loadHistory]);
 
+  // Set initial scroll position to the bottom synchronously before the first paint,
+  // so the user never sees the list start from the top.
+  const initialScrollDone = useRef(false);
+  useLayoutEffect(() => {
+    if (initialScrollDone.current || loadingHistory || messages.length === 0) return;
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    container.style.scrollBehavior = "auto";
+    container.scrollTop = container.scrollHeight;
+    container.style.scrollBehavior = "";
+    initialScrollDone.current = true;
+  }, [messages, loadingHistory]);
+
   // Auto-scroll to bottom when the user sends or receives a message.
-  const prevMessageCount = useRef(0);
+  const prevLastKeyRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    // Only auto-scroll when messages are appended (new), not prepended (history).
-    if (messages.length > prevMessageCount.current && prevMessageCount.current > 0) {
+    if (messages.length === 0) return;
+    const last = messages[messages.length - 1];
+    const lastKey = last.clientKey ?? (last.id !== undefined ? String(last.id) : undefined);
+    // Only scroll when the last message changed — i.e., something was appended.
+    // Prepending history changes messages.length but leaves the last message the same.
+    if (lastKey !== undefined && lastKey !== prevLastKeyRef.current && prevLastKeyRef.current !== undefined) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-    prevMessageCount.current = messages.length;
-  }, [messages.length]);
+    prevLastKeyRef.current = lastKey;
+  }, [messages]);
 
   // Smart header: show when scrolling up, hide when scrolling down.
   const lastScrollTop = useRef(0);
@@ -224,6 +242,11 @@ export function ChatPage() {
 
   const sendMessageText = async (text: string) => {
     setSending(true);
+    const handleError = (msg: string) => {
+      setMessages((prev) => [...prev, { role: "ai", content: msg }]);
+      setSending(false);
+      setTyping(false);
+    };
     try {
       const res = await fetch("/v1/chat", {
         method: "POST",
@@ -233,16 +256,13 @@ export function ChatPage() {
       if (!res.ok) {
         const err = await res.text();
         console.error(`Chat API error (${res.status}):`, err);
-        setMessages((prev) => [...prev, { role: "ai", content: `Error: ${err}` }]);
-        setSending(false);
-        setTyping(false);
+        handleError(`Error: ${err}`);
+        return;
       }
       // On success (200 or 202), human message and AI response arrive via SSE.
     } catch (err) {
       console.error("Chat network error:", err);
-      setMessages((prev) => [...prev, { role: "ai", content: `Network error: ${err}` }]);
-      setSending(false);
-      setTyping(false);
+      handleError(`Network error: ${err}`);
     }
   };
 
@@ -259,7 +279,8 @@ export function ChatPage() {
   const transcribeAndSend = async (blob: Blob, mimeType: string) => {
     setTranscribing(true);
     try {
-      const res = await fetch("/v1/voice", {
+      const localTime = encodeURIComponent(new Date().toString());
+      const res = await fetch(`/v1/voice?local_time=${localTime}`, {
         method: "POST",
         headers: { "Content-Type": mimeType },
         body: blob,
@@ -339,6 +360,7 @@ export function ChatPage() {
       }, 100);
     } catch (err) {
       console.error("Microphone access error:", err);
+      setRecording(false);
     }
   };
 

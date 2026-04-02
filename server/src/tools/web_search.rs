@@ -29,7 +29,9 @@ impl Tool for WebSearch {
 
     fn description(&self) -> &'static str {
         "Search the web using DuckDuckGo. Returns titles, URLs, and snippets for the top results. \
-         Use this to find current information, news, documentation, or anything not in memory."
+         Use this ONLY for information that changes over time or requires real-time data: \
+         current news, live prices, recent events, or verifying something time-sensitive. \
+         Do NOT use for general knowledge, definitions, or anything you can answer from training data."
     }
 
     fn parameters(&self) -> Option<Value> {

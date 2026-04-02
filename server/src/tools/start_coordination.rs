@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -6,7 +7,7 @@ use sqlx::SqlitePool;
 use synaptic::core::{SynapticError, Tool};
 
 use crate::config::LlmConfig;
-use crate::context::CURRENT_USER_ID;
+use crate::context::{COORDINATION_SPAWNED, CURRENT_USER_ID};
 use crate::coordinator::CoordinatorAgent;
 use crate::memory::UserStorePool;
 use crate::provider;
@@ -43,11 +44,11 @@ impl Tool for Coordinate {
     }
 
     fn description(&self) -> &'static str {
-        "Coordinate with other agents on this server to fulfill a user's request. \
-         Use this when the user mentions an @handle, or when answering their request \
-         requires information or input from another user's agent. \
-         The coordinator will find the relevant agents, exchange messages, and return \
-         a conclusion you can relay directly to the user."
+        "Coordinate with one or more agents on this server to fulfill a user's request. \
+         Pass the full user request including all @mentions — the coordinator handles \
+         finding and contacting every relevant agent itself. \
+         Call this tool ONCE per user request, never once per @mention. \
+         The coordinator will return a conclusion you can relay directly to the user."
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -87,7 +88,10 @@ impl Tool for Coordinate {
                 .flatten()
                 .map(|p| p.name)
                 .unwrap_or_else(|| initiator_user_id.clone()),
-            Err(_) => initiator_user_id.clone(),
+            Err(e) => {
+                tracing::warn!(user_id = %initiator_user_id, "failed to load user store for initiator name: {e:#}");
+                initiator_user_id.clone()
+            }
         };
 
         let agent = CoordinatorAgent {
@@ -103,9 +107,10 @@ impl Tool for Coordinate {
             agent.run_and_deliver(&request).await;
         });
 
-        Ok(serde_json::json!(
-            "I'm coordinating with the relevant agents on your request. \
-             I'll follow up with the result shortly."
-        ))
+        COORDINATION_SPAWNED
+            .try_with(|flag| flag.store(true, Ordering::SeqCst))
+            .ok();
+
+        Ok(serde_json::json!("Coordinating."))
     }
 }

@@ -1,35 +1,27 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use synaptic::core::{SynapticError, Tool};
 
+use crate::context::TOOL_FAILURE_COUNT;
+
 /// A tool wrapper that catches errors, returns them to the LLM as results,
-/// and tracks the total number of failures per conversation turn.
+/// and tracks the total number of failures per conversation turn via a
+/// task-local counter — correctly isolated per invocation even under
+/// concurrent users.
 ///
-/// After `max_retries` total tool failures (across all tools), the error
-/// message includes an instruction to stop retrying and explain the problem.
-///
-/// The counter is shared across all tools for a given conversation turn and
-/// must be reset before each `graph.invoke()`.
+/// After `max_retries` total tool failures the error message includes an
+/// instruction to stop retrying and explain the problem.
 pub struct RetryAwareTool {
     inner: Arc<dyn Tool>,
-    failure_count: Arc<AtomicUsize>,
     max_retries: usize,
 }
 
 impl RetryAwareTool {
-    pub fn wrap(
-        inner: Arc<dyn Tool>,
-        failure_count: Arc<AtomicUsize>,
-        max_retries: usize,
-    ) -> Arc<dyn Tool> {
-        Arc::new(Self {
-            inner,
-            failure_count,
-            max_retries,
-        })
+    pub fn wrap(inner: Arc<dyn Tool>, max_retries: usize) -> Arc<dyn Tool> {
+        Arc::new(Self { inner, max_retries })
     }
 }
 
@@ -55,7 +47,9 @@ impl Tool for RetryAwareTool {
                 Ok(value)
             }
             Err(err) => {
-                let count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
+                let count = TOOL_FAILURE_COUNT
+                    .try_with(|c| c.fetch_add(1, Ordering::SeqCst) + 1)
+                    .unwrap_or(1);
                 let error_msg = err.to_string();
                 tracing::warn!(
                     tool = self.name(),

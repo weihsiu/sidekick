@@ -54,6 +54,7 @@ impl CoordinatorAgent {
         );
         let http = Client::new();
         let url = format!("{}/v1/coordinator/message", self.base_url);
+        let local_time = chrono::Local::now().to_string();
         match http
             .post(&url)
             .bearer_auth(&self.secret)
@@ -64,6 +65,7 @@ impl CoordinatorAgent {
                 "is_conclusion":  true,
                 "session_type":   "agent_coordination",
                 "initiator_name": self.initiator_name,
+                "local_time":     local_time,
             }))
             .send()
             .await
@@ -317,7 +319,9 @@ async fn send_and_await(
                                                 .as_str()
                                                 .unwrap_or("")
                                                 .to_string();
-                                            let _ = tx.send(content);
+                                            if tx.send(content).is_err() {
+                                                tracing::warn!("coordinator response arrived after receiver was dropped (timeout?)");
+                                            }
                                             return;
                                         }
                                     }
@@ -337,6 +341,7 @@ async fn send_and_await(
 
     // Post the coordinator message.
     tracing::info!(session_id, agent_name, "coordinator → agent: {content}");
+    let local_time = chrono::Local::now().to_string();
     http.post(&format!("{}/v1/coordinator/message", agent_url))
         .bearer_auth(secret)
         .json(&serde_json::json!({
@@ -346,6 +351,7 @@ async fn send_and_await(
             "is_conclusion":  false,
             "session_type":   "agent_coordination",
             "initiator_name": initiator_name,
+            "local_time":     local_time,
         }))
         .send()
         .await

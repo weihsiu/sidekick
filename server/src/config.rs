@@ -118,6 +118,19 @@ pub struct AgentConfig {
     /// coordinate with each other. Required to use multi-agent coordination.
     #[serde(default)]
     pub coordinator_secret: Option<String>,
+    /// Tools available to the main chat LLM. Each entry is matched as a
+    /// substring of the tool name — e.g. "gmail" enables all Gmail tools.
+    /// Empty list means all tools are enabled.
+    #[serde(default)]
+    pub chat_tools: Vec<String>,
+    /// Tools available to the LLM when processing incoming coordinator messages.
+    /// Same substring matching as chat_tools. Empty list means all tools are enabled.
+    #[serde(default)]
+    pub coordinator_tools: Vec<String>,
+    /// Tools available to this agent when being queried by a coordinator.
+    /// Same substring matching as chat_tools. Empty list means all tools are enabled.
+    #[serde(default)]
+    pub agent_tools: Vec<String>,
 }
 
 fn default_max_tool_retries() -> usize {

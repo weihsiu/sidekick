@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 use opencc_rust::{DefaultConfig, OpenCC};
 
 use crate::context;
-use crate::memory::UserStorePool;
+use crate::memory::{format_context, UserStorePool};
 
 const CHANNEL_CAPACITY: usize = 32;
 
@@ -66,9 +66,13 @@ pub fn parse_structured_response(raw: &str) -> (String, f32) {
 
 pub struct ChatService {
     pool: Arc<UserStorePool>,
-    graph: CompiledGraph<MessageState>,
+    /// Graph used for normal chat (`run_llm`).
+    chat_graph: CompiledGraph<MessageState>,
+    /// Graph used when processing incoming coordinator messages (`run_llm_coordinator`).
+    coordinator_graph: CompiledGraph<MessageState>,
+    /// Graph used when this agent is being queried by a coordinator.
+    agent_graph: CompiledGraph<MessageState>,
     system_prompt: String,
-    tool_failure_count: Arc<AtomicUsize>,
     /// Per-user broadcast channels. Created lazily on first subscribe.
     channels: DashMap<String, broadcast::Sender<UserEvent>>,
     /// Converts any Simplified Chinese characters in LLM output to Traditional Chinese (Taiwan).
@@ -78,9 +82,10 @@ pub struct ChatService {
 impl ChatService {
     pub fn new(
         pool: Arc<UserStorePool>,
-        graph: CompiledGraph<MessageState>,
+        chat_graph: CompiledGraph<MessageState>,
+        coordinator_graph: CompiledGraph<MessageState>,
+        agent_graph: CompiledGraph<MessageState>,
         system_prompt: String,
-        tool_failure_count: Arc<AtomicUsize>,
     ) -> Self {
         let opencc = match OpenCC::new(DefaultConfig::S2TWP) {
             Ok(cc) => {
@@ -94,9 +99,10 @@ impl ChatService {
         };
         Self {
             pool,
-            graph,
+            chat_graph,
+            coordinator_graph,
+            agent_graph,
             system_prompt,
-            tool_failure_count,
             channels: DashMap::new(),
             opencc,
         }
@@ -107,11 +113,11 @@ impl ChatService {
         &self.pool
     }
 
-/// Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
+    /// Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
     /// No-op for non-Chinese text or when OpenCC is unavailable.
     pub fn convert(&self, text: &str) -> String {
         if let Some(ref cc) = self.opencc {
-            cc.lock().unwrap().convert(text)
+            cc.lock().unwrap_or_else(|e| e.into_inner()).convert(text)
         } else {
             text.to_string()
         }
@@ -155,6 +161,7 @@ impl ChatService {
         message: &str,
         local_time: Option<&str>,
         now: &str,
+        mention_context: Option<&str>,
     ) -> Result<()> {
         let user_mem = self.pool.get(user_id).await?;
 
@@ -175,22 +182,35 @@ impl ChatService {
             ),
         };
         messages.push(Message::system(&time_str));
-        // If the user mentioned an @handle, nudge the LLM to use the coordinate tool.
-        if message.contains('@') {
-            messages.push(Message::system(
-                "The user's message contains an @handle. If they want to contact or coordinate \
-                 with another user's agent, use the `coordinate` tool to fulfill the request.",
-            ));
+        // Always retrieve relevant long-term memories for this message.
+        if let Ok(entries) = user_mem.retrieve(message, None).await {
+            let ctx = format_context(&entries);
+            if !ctx.is_empty() {
+                messages.push(Message::system(&ctx));
+            }
+        }
+
+        if let Some(ctx) = mention_context {
+            messages.push(Message::system(ctx));
         }
         messages.push(Message::human(message));
 
         // Invoke LLM agent.
         let msg_state = MessageState { messages };
-        self.tool_failure_count.store(0, Ordering::SeqCst);
+        let coordination_flag = Arc::new(AtomicBool::new(false));
         let result = context::CURRENT_USER_ID
-            .scope(user_id.to_string(), self.graph.invoke(msg_state))
+            .scope(user_id.to_string(), context::TOOL_FAILURE_COUNT
+                .scope(AtomicUsize::new(0), context::COORDINATION_SPAWNED
+                    .scope(coordination_flag.clone(), self.chat_graph.invoke(msg_state))))
             .await
             .context("LLM invocation failed")?;
+
+        // If the coordinate tool was called, the coordinator will deliver the
+        // final answer — suppress run_llm's own response so the user sees only
+        // the coordinator conclusion (typing indicator stays on until then).
+        if coordination_flag.load(Ordering::SeqCst) {
+            return Ok(());
+        }
 
         let raw = result
             .state()
@@ -201,13 +221,7 @@ impl ChatService {
         let (response, importance) = parse_structured_response(&raw);
         tracing::debug!(importance = importance, "chat response importance");
 
-        // Convert any Simplified Chinese characters to Traditional Chinese (Taiwan).
-        // No-op for non-Chinese text.
-        let response = if let Some(ref cc) = self.opencc {
-            cc.lock().unwrap().convert(&response)
-        } else {
-            response
-        };
+        let response = self.convert(&response);
 
         // Persist AI response to SQLite, LanceDB, and the chat window.
         let ai_id = user_mem
@@ -252,6 +266,7 @@ impl ChatService {
         is_conclusion: bool,
         is_agent_coordination: bool,
         initiator_name: &str,
+        local_time: Option<&str>,
         now: &str,
     ) -> Result<()> {
         let user_mem = self.pool.get(user_id).await?;
@@ -264,10 +279,22 @@ impl ChatService {
             .await
             .context("failed to load chat history")?;
         messages.extend(history);
-        messages.push(Message::system(&format!(
-            "Current date and time (UTC): {}",
-            Utc::now().format("%A, %B %-d, %Y %H:%M UTC")
-        )));
+        let time_str = match local_time {
+            Some(t) => format!("Current date and time: {}", t),
+            None => format!(
+                "Current date and time (UTC): {}",
+                Utc::now().format("%A, %B %-d, %Y %H:%M UTC")
+            ),
+        };
+        messages.push(Message::system(&time_str));
+        // Always retrieve relevant long-term memories for this message.
+        if let Ok(entries) = user_mem.retrieve(message, None).await {
+            let ctx = format_context(&entries);
+            if !ctx.is_empty() {
+                messages.push(Message::system(&ctx));
+            }
+        }
+
         if is_conclusion {
             messages.push(Message::system(
                 "A multi-agent coordination session you initiated has just concluded. \
@@ -295,9 +322,13 @@ impl ChatService {
         messages.push(Message::human(message));
 
         let msg_state = MessageState { messages };
-        self.tool_failure_count.store(0, Ordering::SeqCst);
+        // Agents being queried by a coordinator use the full chat graph — they
+        // need access to calendars, contacts, etc. to answer on behalf of their user.
+        // The coordinator_graph is reserved for agents acting as the coordinator itself.
+        let graph = if is_agent_coordination { &self.agent_graph } else { &self.coordinator_graph };
         let result = context::CURRENT_USER_ID
-            .scope(user_id.to_string(), self.graph.invoke(msg_state))
+            .scope(user_id.to_string(), context::TOOL_FAILURE_COUNT
+                .scope(AtomicUsize::new(0), graph.invoke(msg_state)))
             .await
             .context("coordinator LLM invocation failed")?;
 
@@ -308,12 +339,7 @@ impl ChatService {
             .unwrap_or_default();
 
         let (response, importance) = parse_structured_response(&raw);
-
-        let response = if let Some(ref cc) = self.opencc {
-            cc.lock().unwrap().convert(&response)
-        } else {
-            response
-        };
+        let response = self.convert(&response);
 
         // Store the incoming coordinator message (always hidden).
         user_mem

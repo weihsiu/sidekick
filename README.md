@@ -131,14 +131,17 @@ Remove this section to disable voice input entirely.
 | `model` | Whisper model name (e.g. `"whisper-large-v3-turbo"`) |
 | `base_url` | *(optional)* Override the STT endpoint |
 
-### `[agent]` — System prompt and tools
+### `[agent]` — Agent behaviour
 
 | Field | Description |
 |-------|-------------|
-| `system_prompt` | Base system prompt defining the agent's persona and behavior. |
-| `max_tool_retries` | *(optional, default `3`)* Max tool call failures before the agent stops retrying for that conversation turn. |
-| `coordinator_secret` | *(optional)* Shared secret for server-to-server coordinator authentication. Set the same value via `COORDINATOR_SECRET` env var on all instances that should be able to coordinate with each other. |
-| `coordinator_max_rounds` | *(optional, default `10`)* Max coordinator loop iterations before forcing a conclusion. |
+| `system_prompt` | Base system prompt defining the agent's persona and behaviour |
+| `max_tool_retries` | *(optional, default `3`)* Max tool call failures before the agent stops retrying for that conversation turn |
+| `chat_tools` | List of tool name substrings available to the main chat LLM. Empty list enables all tools. |
+| `coordinator_tools` | List of tool name substrings available when this agent acts as the conclusion relay for a coordinator session |
+| `agent_tools` | List of tool name substrings available when this agent is queried by a coordinator on behalf of another user |
+| `coordinator_secret` | *(optional)* Shared secret for server-to-server coordinator authentication. Set the same value via `COORDINATOR_SECRET` env var on all instances that should coordinate with each other. |
+| `coordinator_max_rounds` | *(optional, default `10`)* Max coordinator loop iterations before forcing a conclusion |
 
 ### Example configurations
 
@@ -397,6 +400,7 @@ Browse memory entries with cursor-based pagination (infinite scroll). Returns en
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
 | `before` | integer | *(latest)* | Cursor — return entries with ID less than this value |
+| `after` | integer | *(none)* | Return entries with ID greater than this value (used to catch up after SSE reconnect) |
 | `limit` | integer | `20` | Max entries to return (capped at 100) |
 | `category` | string | *(all)* | Filter by category (e.g. `conversation`, `knowledge`) |
 
@@ -421,7 +425,7 @@ Response:
 ]
 ```
 
-To paginate, pass the smallest `id` from the current page as the `before` parameter in the next request.
+To paginate older messages, pass the smallest `id` from the current page as the `before` parameter in the next request.
 
 ### Coordinator endpoints (server-to-server)
 
@@ -525,16 +529,17 @@ The `server/flyio/fly.toml` configures:
 - **Real-time multi-client sync**: All browser tabs and devices logged in as the same user share a live SSE connection (`GET /v1/events`). When any client sends a message, the human message and AI response are broadcast to every connected client simultaneously via per-user `tokio::sync::broadcast` channels stored in a `DashMap`.
 - **Service layer**: `ChatService` encapsulates all message-processing logic (LLM invocation, persistence, broadcast) independently of HTTP. Axum handlers are thin wrappers that authenticate and delegate.
 - **Dual-store memory**: LanceDB for semantic/vector search (RAG retrieval) + SQLite for ordered, cursor-based browsing (infinite scroll). All writes go to both stores.
-- **Memory pool**: A single LRU cache manages both databases per user as one unit, evicting idle users to conserve file descriptors
-- **Thread-safe writes**: A per-database mutex serialises store operations and FTS index rebuilds while reads proceed concurrently
-- **Chat window**: Short-term context via Synaptic's `ConversationWindowMemory` for recent conversational continuity
-- **Hybrid retrieval**: Dense vector cosine similarity + full-text keyword matching, fused with Reciprocal Rank Fusion (RRF)
-- **Reranking**: Retrieved results are reranked with configurable category weight boosts
+- **Memory pool**: A single LRU cache manages both databases per user as one unit, evicting idle users to conserve file descriptors.
+- **Thread-safe writes**: A per-database mutex serialises store operations and FTS index rebuilds while reads proceed concurrently.
+- **Chat window**: Short-term context via Synaptic's `ConversationWindowMemory` for recent conversational continuity.
+- **Hybrid retrieval**: Dense vector cosine similarity + full-text keyword matching, fused with Reciprocal Rank Fusion (RRF).
+- **Reranking**: Retrieved results are reranked with configurable category weight boosts.
 - **Tool-based long-term memory**: The agent calls `recall_memory` on demand rather than pre-injecting RAG context. This avoids bloating every prompt — the agent retrieves only when it actually needs past context.
-- **Multi-agent coordination**: When the user mentions an @handle or asks to coordinate with someone, the agent calls `start_coordination_session`. This spawns a `CoordinatorAgent` in a background task, which uses its own LLM loop to find agents via `find_agents`, send messages to them via `/v1/coordinator/message`, await their responses via SSE, and deliver a synthesised conclusion back to the initiating user. Coordinator agents identify themselves explicitly in messages to other agents, and receiving agents are told via their system prompt that they are serving a coordinator acting on behalf of a named user.
+- **Multi-agent coordination**: When the user's message contains an `@mention`, the server resolves the handle against the directory before the LLM runs. Resolved handles (user_id + display name) are injected as system context. If the request is complete the LLM calls the `coordinate` tool, which spawns a `CoordinatorAgent` in a background task. The coordinator uses its own LLM loop with `find_agent` and `message_agent` tools to contact other agents via HTTP+SSE and synthesise a conclusion. The conclusion is delivered back to the initiating user as a normal chat message; the LLM's own intermediate response is suppressed so the user sees only the coordinator's final answer. Unresolved or ambiguous @mentions are reported to the LLM so it can inform the user.
+- **Three-graph agent architecture**: Three separate ReAct graphs with independently configurable tool sets — `chat_graph` for normal conversation, `coordinator_graph` for relaying coordinator conclusions, and `agent_graph` for when this agent is queried by another coordinator. Tool availability per graph is configured via `chat_tools`, `coordinator_tools`, and `agent_tools` in `config.toml`.
+- **Per-invocation tool isolation**: Tool failure counts and the coordination-spawned flag are stored in `tokio::task_local!` variables scoped around each `graph.invoke()` call, so concurrent users cannot interfere with each other's tool state.
 - **Voice input**: `POST /v1/voice` accepts raw audio, transcribes it via Whisper (Groq or any OpenAI-compatible endpoint), and processes it identically to a typed message. Requires `[stt]` in config.
 - **Structured LLM responses**: The agent returns structured JSON with an `importance` score (1–10). High-importance responses are written to long-term memory; low-importance ones are skipped, reducing noise in the memory stores.
-- **Agent tools**: The agent can call tools to act on the user's behalf. Tools read the current user ID from a task-local context set per request, so tool calls in concurrent requests are always isolated to the correct user.
 - **Traditional Chinese output**: LLM responses are passed through OpenCC (S2TWP) to convert any Simplified Chinese characters to Traditional Chinese (Taiwan). No-op for non-Chinese text.
 - **PWA**: Installable progressive web app with service worker caching for offline static assets. Links in chat messages open in the system browser.
 
@@ -545,15 +550,17 @@ The `server/flyio/fly.toml` configures:
 3. Client opens a persistent SSE connection to `GET /v1/events`
 4. Client sends a `POST /v1/chat` with a `message`
 5. Server saves the human message to SQLite and immediately broadcasts a `human_message` event to all connected clients for that user
-6. The user's databases are opened from the pool (or created on first use)
-7. The system prompt + recent chat window (last N messages) are assembled as the message history
-8. The LLM generates a response, calling tools as needed:
+6. If the message contains `@mentions`, the server resolves them against the directory (case-insensitive, with display-name prefix fallback) and injects the resolved user_ids into the LLM's system context
+7. The user's databases are opened from the pool (or created on first use)
+8. The system prompt + recent chat window (last N messages) are assembled as the message history
+9. The LLM generates a response, calling tools as needed:
    - `recall_memory` to search long-term memory on demand
    - Google tools to read calendar, mail, tasks, and contacts
-   - `web_search` for current information
-   - `find_agents` + `start_coordination_session` to coordinate with other users' agents
-9. Both the user message and the assistant response are stored in LanceDB (semantic) and SQLite (history), plus the chat window (short-term)
-10. Server broadcasts an `ai_response` event — all connected clients display the response simultaneously
+   - `web_search` for real-time or time-sensitive information only
+   - `find_agents` to search the directory for other users
+   - `coordinate` to start a multi-agent coordination session
+10. If `coordinate` was called: the LLM's own response is suppressed; the coordinator runs in the background and delivers the final answer via SSE when complete
+11. Otherwise: both the user message and the assistant response are stored in LanceDB (semantic) and SQLite (history), plus the chat window (short-term), and an `ai_response` SSE event is broadcast to all connected clients
 
 ## Data stores
 
@@ -582,14 +589,14 @@ Each entry in a user's SQLite database:
 
 ## Agent tools
 
-The agent has access to the following tools:
+The agent has access to the following tools. Which tools are available in each context is configurable via `chat_tools`, `coordinator_tools`, and `agent_tools` in `config.toml`.
 
 | Tool | Description |
 |------|-------------|
 | `recall_memory` | Semantic search over the user's long-term memory. Called on demand when the agent needs past context. |
-| `web_search` | Search the web via DuckDuckGo — no API key required |
+| `web_search` | Search the web via DuckDuckGo for real-time or time-sensitive information. No API key required. |
 | `find_agents` | Search the server directory for other users' agents by name or @handle |
-| `start_coordination_session` | Start a multi-agent coordination session. Spawns a coordinator agent that messages other agents on the user's behalf and delivers a synthesised conclusion back to the user. |
+| `coordinate` | Start a multi-agent coordination session. Spawns a coordinator that contacts other agents on the user's behalf and delivers a synthesised conclusion. |
 | `gmail` | Search and read messages, send email, modify labels |
 | `google_calendar` | List, create, update, and delete calendar events; check availability |
 | `google_tasks` | Manage task lists and individual tasks |
@@ -597,7 +604,7 @@ The agent has access to the following tools:
 
 Google tools require the user to have granted the relevant OAuth scopes (configured per provider in `config.toml`). Tokens are fetched and refreshed automatically — tools never prompt for re-authentication mid-conversation.
 
-All tools are wrapped with a retry layer that retries on transient failures. The limit is set via `agent.max_tool_retries` in `config.toml` (default: `3`).
+All tools are wrapped with a retry layer that counts failures per invocation via a task-local counter. The limit is set via `agent.max_tool_retries` in `config.toml`.
 
 ## Project structure
 
@@ -607,11 +614,11 @@ server/
   config.toml             # Runtime configuration
   dev.sh                  # Local dev launcher (sets OPENCC_DIR, BASE_URL, FRONTEND_URL)
   src/
-    main.rs               # HTTP server, API handlers, --import CLI
+    main.rs               # HTTP server, API handlers, @mention resolution, --import CLI
     chat_service.rs       # ChatService: message processing, LLM invocation, SSE broadcast
     coordinator.rs        # CoordinatorAgent: multi-agent coordination loop + tools
     config.rs             # Config file parsing
-    context.rs            # Task-local CURRENT_USER_ID for per-user tool isolation
+    context.rs            # Task-locals: CURRENT_USER_ID, TOOL_FAILURE_COUNT, COORDINATION_SPAWNED
     error.rs              # API error types (thiserror + anyhow)
     migrations.rs         # SQLite and LanceDB schema versioning
     provider.rs           # Builds the ChatModel from config
@@ -635,9 +642,9 @@ server/
       google_people.rs    # Google Contacts tool
       recall_memory.rs    # Semantic memory recall tool
       web_search.rs       # Web search via DuckDuckGo (no API key required)
-      find_agents.rs      # Directory search tool (used by coordinator and user agent)
+      find_agents.rs      # Directory search tool
       start_coordination.rs  # Coordination session launcher tool
-      retry_wrapper.rs    # Retry wrapper for transient failures
+      retry_wrapper.rs    # Per-invocation retry wrapper with task-local failure count
 client/
   package.json            # React + Vite PWA frontend
   vite.config.ts          # Dev server with API proxy to backend
@@ -650,6 +657,6 @@ client/
     auth.tsx              # AuthProvider context (session check via /auth/me)
     pages/
       Login.tsx           # OAuth login buttons (Google, Facebook)
-      Chat.tsx            # Chat interface with infinite scroll history
+      Chat.tsx            # Chat interface with infinite scroll, voice input, SSE sync
     styles.css            # Styling
 ```

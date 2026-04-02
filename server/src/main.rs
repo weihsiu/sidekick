@@ -17,7 +17,6 @@ mod user;
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -105,6 +104,7 @@ impl From<CookieKey> for Key {
 
 struct AppState {
     chat_service: Arc<ChatService>,
+    db: Arc<sqlx::SqlitePool>,
     cookie_key: CookieKey,
     stt: Option<Arc<SttClient>>,
     coordinator_secret: Option<String>,
@@ -183,6 +183,10 @@ struct CoordinatorMessageRequest {
     session_type: String,
     /// Display name of the initiating user on whose behalf the coordinator is acting.
     initiator_name: String,
+    /// Caller's local time string (e.g. from JS Date.toString()). Used to inject
+    /// timezone-aware time into the receiving agent's system prompt.
+    #[serde(default)]
+    local_time: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -219,6 +223,110 @@ async fn sse_handler(
     ))
 }
 
+/// Extract @handles from a message and look each one up in the directory.
+/// Returns one entry per unique handle: (handle, matches) where matches is a
+/// Vec<(user_id, display_name)>. Empty matches = not found; 2+ = ambiguous.
+/// Lookup is case-insensitive: tries handle first, then display_name prefix.
+async fn resolve_mentions(
+    text: &str,
+    db: &sqlx::SqlitePool,
+) -> Vec<(String, Vec<(String, String)>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            // Only treat as a mention if @ is at the start or preceded by whitespace.
+            // This avoids treating email addresses (user@example.com) as mentions.
+            let preceded_by_space = i == 0 || bytes[i - 1].is_ascii_whitespace();
+            i += 1;
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if !preceded_by_space || i == start {
+                continue;
+            }
+            let handle = text[start..i].to_string();
+            if seen.insert(handle.clone()) {
+                let prefix = format!("{}%", handle);
+                let rows: Vec<(String, String)> = sqlx::query_as(
+                    "SELECT user_id, display_name FROM directory \
+                     WHERE visible = 1 AND (\
+                         LOWER(handle) = LOWER(?) \
+                         OR LOWER(display_name) LIKE LOWER(?) \
+                     ) \
+                     ORDER BY CASE WHEN LOWER(handle) = LOWER(?) THEN 0 ELSE 1 END \
+                     LIMIT 3",
+                )
+                .bind(&handle)
+                .bind(&prefix)
+                .bind(&handle)
+                .fetch_all(db)
+                .await
+                .unwrap_or_default();
+                results.push((handle, rows));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    results
+}
+
+/// Format mention resolution results into a system message for the LLM.
+/// Returns None if there are no @mentions in the message.
+fn build_mention_context(mentions: &[(String, Vec<(String, String)>)]) -> Option<String> {
+    if mentions.is_empty() {
+        return None;
+    }
+    let mut resolved = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut not_found = Vec::new();
+
+    for (handle, matches) in mentions {
+        match matches.len() {
+            0 => not_found.push(format!("@{handle}")),
+            1 => {
+                let (user_id, display_name) = &matches[0];
+                resolved.push(format!("  @{handle} → {display_name} (user_id: {user_id})"));
+            }
+            _ => {
+                let options: Vec<String> = matches
+                    .iter()
+                    .map(|(uid, name)| format!("{name} (user_id: {uid})"))
+                    .collect();
+                ambiguous.push(format!("  @{handle} matches multiple users: {}", options.join(", ")));
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if !resolved.is_empty() {
+        parts.push(format!(
+            "The following @mentions have been resolved to registered users on this server:\n{}\n\
+             If you have all the information needed to fulfill the request, call the `coordinate` \
+             tool with the full message. If anything is missing, ask the user first.",
+            resolved.join("\n")
+        ));
+    }
+    if !ambiguous.is_empty() {
+        parts.push(format!(
+            "The following @mentions are ambiguous — ask the user to clarify which person they mean:\n{}",
+            ambiguous.join("\n")
+        ));
+    }
+    if !not_found.is_empty() {
+        parts.push(format!(
+            "The following @mentions could not be resolved to any registered user: {}. \
+             Inform the user that these handles were not found.",
+            not_found.join(", ")
+        ));
+    }
+    Some(parts.join("\n\n"))
+}
+
 /// Submit a message. The human message and AI response are delivered to all
 /// connected clients (including the sender) via SSE.
 async fn chat_handler(
@@ -237,12 +345,15 @@ async fn chat_handler(
         .persist_human_message(&user.id, &req.message)
         .await?;
 
+    let mentions = resolve_mentions(&req.message, &state.db).await;
+    let mention_context = build_mention_context(&mentions);
+
     let chat_service = Arc::clone(&state.chat_service);
     let user_id = user.id.clone();
     let message = req.message.clone();
     let local_time = req.local_time.clone();
     tokio::spawn(async move {
-        if let Err(e) = chat_service.run_llm(&user_id, &message, local_time.as_deref(), &now).await {
+        if let Err(e) = chat_service.run_llm(&user_id, &message, local_time.as_deref(), &now, mention_context.as_deref()).await {
             tracing::error!("LLM processing failed for {user_id}: {e:#}");
             chat_service.broadcast_error(&user_id, "AI processing failed. Please try again.");
         }
@@ -254,10 +365,17 @@ async fn chat_handler(
 /// Voice input: transcribe audio then immediately persist the human message,
 /// broadcast it via SSE, and spawn LLM processing — all in one request.
 /// The client never needs to make a separate /v1/chat call for voice input.
+
+#[derive(Deserialize)]
+struct VoiceQuery {
+    local_time: Option<String>,
+}
+
 async fn voice_handler(
     mut auth_session: AuthSession<AuthBackend>,
     jar: Jar,
     State(state): State<Arc<AppState>>,
+    Query(query): Query<VoiceQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -289,11 +407,14 @@ async fn voice_handler(
         .persist_human_message(&user.id, &transcript)
         .await?;
 
+    let mentions = resolve_mentions(&transcript, &state.db).await;
+    let mention_context = build_mention_context(&mentions);
+
     // Spawn LLM in background — response arrives via SSE.
     let chat_service = Arc::clone(&state.chat_service);
     let user_id = user.id.clone();
     tokio::spawn(async move {
-        if let Err(e) = chat_service.run_llm(&user_id, &transcript, None, &now).await {
+        if let Err(e) = chat_service.run_llm(&user_id, &transcript, query.local_time.as_deref(), &now, mention_context.as_deref()).await {
             tracing::error!("LLM processing failed for {user_id}: {e:#}");
             chat_service.broadcast_error(&user_id, "AI processing failed. Please try again.");
         }
@@ -341,10 +462,11 @@ async fn coordinator_message_handler(
     let is_conclusion = req.is_conclusion;
     let is_agent_coordination = req.session_type == "agent_coordination";
     let initiator_name = req.initiator_name.clone();
+    let local_time = req.local_time.clone();
 
     tokio::spawn(async move {
         if let Err(e) = chat_service
-            .run_llm_coordinator(&user_id, &message, &session_id, is_conclusion, is_agent_coordination, &initiator_name, &now)
+            .run_llm_coordinator(&user_id, &message, &session_id, is_conclusion, is_agent_coordination, &initiator_name, local_time.as_deref(), &now)
             .await
         {
             tracing::error!("coordinator LLM failed for {user_id}: {e:#}");
@@ -478,12 +600,39 @@ async fn history_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Tool filtering
+// ---------------------------------------------------------------------------
+
+/// Filter a tool list by an optional allowlist.
+/// Each allowlist entry is matched as a **substring** of the tool name, so
+/// `"gmail"` matches `list_gmail_messages`, `send_gmail_message`, etc.
+/// When `allowlist` is `None` all tools are returned unchanged.
+fn filter_tools(
+    tools: &[Arc<dyn synaptic::core::Tool>],
+    allowlist: &[String],
+) -> Vec<Arc<dyn synaptic::core::Tool>> {
+    if allowlist.is_empty() {
+        return tools.to_vec();
+    }
+    tools
+        .iter()
+        .filter(|t| {
+            let name = t.name();
+            allowlist.iter().any(|entry| name.contains(entry.as_str()))
+        })
+        .cloned()
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv().ok();
+    if let Err(e) = dotenv() {
+        tracing::debug!("dotenv: {e}");
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -587,7 +736,6 @@ async fn main() -> anyhow::Result<()> {
     )?);
 
     // --- Tools ---
-    let tool_failure_count = Arc::new(AtomicUsize::new(0));
     let max_tool_retries = cfg.agent.max_tool_retries;
     let mut all_tools: Vec<Arc<dyn synaptic::core::Tool>> = vec![
         tools::recall_memory::RecallMemory::new(pool.clone()),
@@ -611,22 +759,30 @@ async fn main() -> anyhow::Result<()> {
     }
     let all_tools: Vec<Arc<dyn synaptic::core::Tool>> = all_tools
         .into_iter()
-        .map(|tool| {
-            tools::retry_wrapper::RetryAwareTool::wrap(
-                tool,
-                tool_failure_count.clone(),
-                max_tool_retries,
-            )
-        })
+        .map(|tool| tools::retry_wrapper::RetryAwareTool::wrap(tool, max_tool_retries))
         .collect();
 
-    let graph = create_react_agent(model, all_tools).context("failed to create agent")?;
+    let chat_graph = create_react_agent(
+        model.clone(),
+        filter_tools(&all_tools, &cfg.agent.chat_tools),
+    ).context("failed to create chat agent")?;
+
+    let coordinator_graph = create_react_agent(
+        model.clone(),
+        filter_tools(&all_tools, &cfg.agent.coordinator_tools),
+    ).context("failed to create coordinator agent")?;
+
+    let agent_graph = create_react_agent(
+        model,
+        filter_tools(&all_tools, &cfg.agent.agent_tools),
+    ).context("failed to create agent graph")?;
 
     let chat_service = Arc::new(ChatService::new(
         pool,
-        graph,
+        chat_graph,
+        coordinator_graph,
+        agent_graph,
         cfg.agent.system_prompt,
-        tool_failure_count,
     ));
 
     // Background cleanup task: evict broadcast channels with no active subscribers.
@@ -656,6 +812,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         chat_service,
+        db: Arc::new(db),
         cookie_key: CookieKey(cookie_key),
         stt,
         coordinator_secret: cfg.agent.coordinator_secret.clone(),

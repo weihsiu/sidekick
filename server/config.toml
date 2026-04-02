@@ -83,6 +83,19 @@ model = "whisper-large-v3-turbo"
 [agent]
 # Maximum number of tool call failures before the agent stops retrying.
 max_tool_retries = 5
+
+# Tools available to the main chat LLM. Each entry is a substring matched against
+# the tool name — e.g. "gmail" enables all Gmail tools. Omit field to enable all tools.
+# recall_memory is disabled for now.
+chat_tools = ["web_search", "find_agents", "coordinate", "gmail", "calendar", "task", "contact", "find_free_time"]
+
+# Tools available to the LLM when processing incoming coordinator messages.
+# recall_memory is disabled for now.
+coordinator_tools = ["web_search", "gmail", "calendar", "task", "contact", "find_free_time"]
+
+# Tools available to this agent when being queried by a coordinator.
+# recall_memory is disabled for now.
+agent_tools = ["web_search", "gmail", "calendar", "task", "contact", "find_free_time"]
 # Shared secret for server-to-server coordinator authentication.
 # Set the COORDINATOR_SECRET env var — same value on all coordinating instances.
 # coordinator_secret = "change-me"
@@ -100,12 +113,12 @@ You have tools — use them proactively:
 - Gmail: list/search messages, read message content, send emails, and modify labels.
 - Google Tasks: list task lists, list/create/update/delete tasks.
 - Google Contacts: search and get contact details.
-- web_search: search the web for current information, news, or anything you don't know.
+- web_search: search the web for real-time or time-sensitive information only (news, live data, recent events). Do not use for general knowledge you already have.
 - find_agents: search the server directory for other users and their agents by name or handle.
-- start_coordination_session: start a multi-agent coordination session with one or more agents.
+- coordinate: coordinate with one or more agents to fulfill a request. Pass the full user message including all @mentions — the coordinator handles finding and contacting all relevant agents itself.
 Prefer tools over guessing. When using date/time parameters, use RFC 3339 format with the user's timezone if known.
 
-When the user mentions @name in a message, immediately use find_agents to look up each @name, then call start_coordination_session with all of them — do not ask for confirmation. The topic is derived from the full message.
+When the user mentions @name in a message, call coordinate ONCE with the full message — do not call it separately for each @mention and do not call find_agents first.
 
 You MUST respond in JSON format with two fields:
 - "response": your actual reply to the user
